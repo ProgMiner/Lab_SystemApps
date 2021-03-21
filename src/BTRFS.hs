@@ -9,10 +9,18 @@ import Foreign (ForeignPtr, Ptr, FunPtr, withForeignPtr, newForeignPtr, plusPtr,
 import Foreign.C.Error (throwErrnoIfNull)
 import Foreign.C.Types (CSize (CSize))
 
+import Util ((<.>))
+
 -- struct btrfs
 data Btrfs
 
-type BTRFS = ForeignPtr Btrfs
+type OnlyBTRFS = ForeignPtr Btrfs
+
+-- we save ForeignPtr to BTRFS in order to tell GHC that it must not be unmapped
+type BTRFS =
+    ( ForeignPtr () -- pointer to data
+    , OnlyBTRFS     -- pointer to btrfs struct
+    )
 
 -- struct btrfs * btrfs_openfs(const void *, size_t)
 foreign import ccall "btrfs_openfs" btrfsCOpenFS :: Ptr () -> CSize -> IO (Ptr Btrfs)
@@ -25,20 +33,21 @@ btrfsOpenFS
     => ForeignPtr ()    -- pointer to a btrfs volume
     -> i                -- size of a volume
     -> IO BTRFS
-btrfsOpenFS = flip $ flip withForeignPtr . flip btrfsOpenPtrFS . fromIntegral
+btrfsOpenFS ptr = ((,) ptr) <.> f ptr where
+    f :: (Integral i) => ForeignPtr () -> i -> IO OnlyBTRFS
+    f = flip $ flip withForeignPtr . flip btrfsOpenPtrFS . fromIntegral
 
--- change mmapFileForeignPtr to just Ptr due to too early unmap
 btrfsOpenFileFS
     :: FilePath -- path to a file with a btrfs volume
     -> IO BTRFS
 btrfsOpenFileFS path = do
     (ptr, offset, size) <- mmapFileForeignPtr path ReadOnly Nothing
-    withForeignPtr ptr (\p -> btrfsOpenPtrFS (plusPtr p offset) (fromIntegral size))
+    ((,) ptr) <$> withForeignPtr ptr (flip btrfsOpenPtrFS (fromIntegral size) . flip plusPtr offset)
 
 btrfsOpenPtrFS
     :: Ptr ()   -- pointer to a btrfs volume
     -> CSize    -- size of the volume
-    -> IO BTRFS
+    -> IO OnlyBTRFS
 btrfsOpenPtrFS = curry
     $ newForeignPtr btrfsCDeletePtr
     <=< throwErrnoIfNull "btrfs_openfs"

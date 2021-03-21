@@ -1,6 +1,7 @@
 module Main where
 
 import Graphics.UI.WX
+import BTRFS
 
 {-
 
@@ -10,7 +11,9 @@ wxHaskell demo (eaxPlayer) v 0.1
 -}
 
 main :: IO ()
-main = start gui
+main = do
+    btrfsOpenFileFS "testfs"
+    start gui
 
 gui :: IO ()
 gui = do
