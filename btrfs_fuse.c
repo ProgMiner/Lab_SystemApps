@@ -144,7 +144,7 @@ int btrfs_fuse_main(const char * filename, int argc, char * argv[]) {
 
     btrfs = btrfs_openfs(btrfs_data, btrfs_data_length);
     if (!btrfs) {
-        fputs("Cannot read BTRFS from file (error or corrupted).\n", stderr);
+        perror("Cannot read BTRFS from file (error or corrupted)");
         return -1;
     }
 
