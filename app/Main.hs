@@ -2,9 +2,10 @@ module Main where
 
 import Graphics.UI.WX
 import System.Posix.Internals (st_size)
-import Control.Monad ((>=>))
+import Foreign (withForeignPtr)
+import Control.Monad ((>=>), mapM_)
 
-import BTRFS (btrfsOpenFileFS, btrfsStat)
+import BTRFS (btrfsOpenFileFS, btrfsStat, btrfsReadDir)
 import Util ((<.>))
 
 {-
@@ -17,7 +18,9 @@ wxHaskell demo (eaxPlayer) v 0.1
 main :: IO ()
 main = do
     btrfs <- btrfsOpenFileFS "testfs"
-    btrfsStat btrfs "/l1" $ (show <.> st_size) >=> putStrLn
+    btrfsStat btrfs "/l1" >>= (flip withForeignPtr (show <.> st_size) >=> putStrLn)
+    btrfsReadDir btrfs "/ext2_saved" >>= mapM_ putStrLn
+
     start gui
 
 gui :: IO ()

@@ -4,7 +4,8 @@ module BTRFS (
     btrfsOpenFS,
     btrfsOpenFileFS,
     btrfsOpenPtrFS,
-    btrfsStat
+    btrfsStat,
+    btrfsReadDir
 ) where
 
 import Control.Monad ((<=<))
@@ -12,10 +13,10 @@ import System.IO (FilePath)
 import System.IO.MMap (mmapFileForeignPtr, Mode (ReadOnly))
 import System.Posix.Internals (CStat, sizeof_stat)
 import Foreign.C.Error (throwErrnoIfNull)
-import Foreign.C.String (CString, withCString)
+import Foreign.C.String (CString, withCString, peekCString)
 import Foreign.C.Types (CSize (CSize), CInt (CInt))
 import Foreign (ForeignPtr, Ptr, FunPtr, withForeignPtr, newForeignPtr,
-    mallocForeignPtrBytes, plusPtr, nullPtr)
+    mallocForeignPtr, mallocForeignPtrBytes, plusPtr, nullPtr, peek, peekArray)
 
 import Util ((<.>), throwErrnoFromResult)
 
@@ -36,8 +37,21 @@ foreign import ccall "btrfs_openfs" btrfsCOpenFS :: Ptr () -> CSize -> IO (Ptr B
 -- void (* btrfs_delete)(struct btrfs *)
 foreign import ccall "&btrfs_delete" btrfsCDeletePtr :: FunPtr (Ptr Btrfs -> IO ())
 
--- int btrfs_stat(const struct btrfs *, const char *, struct stat *);
+-- int btrfs_stat(const struct btrfs *, const char *, struct stat *)
 foreign import ccall "btrfs_stat" btrfsCStat :: Ptr Btrfs -> CString -> Ptr CStat -> IO CInt
+
+-- int btrfs_readdir(
+--         const struct btrfs * btrfs,
+--         const char * filename,
+--         size_t * length,
+--         char *** contents
+-- )
+foreign import ccall "btrfs_readdir" btrfsCReadDir
+    :: Ptr Btrfs
+    -> CString
+    -> Ptr CSize
+    -> Ptr (Ptr CString)
+    -> IO CInt
 
 btrfsOpenFS
     :: (Integral i)
@@ -67,13 +81,34 @@ btrfsOpenPtrFS = curry
 btrfsStat
     :: BTRFS            -- BTRFS volume
     -> FilePath         -- path to file within volume
-    -> (Ptr CStat -> IO a) -- selector
-    -> IO a
-btrfsStat (_, btrfs) path sel = do
-    stat <- mallocForeignPtrBytes sizeof_stat
+    -> IO (ForeignPtr CStat)
+btrfsStat (_, btrfs) path = do
+    stat <- mallocForeignPtrBytes sizeof_stat :: IO (ForeignPtr CStat)
 
     withForeignPtr btrfs (\pBtrfs ->
         withForeignPtr stat (\pStat ->
             withCString path (\cPath -> do
-                throwErrnoFromResult "btrfs_stat" $ btrfsCStat pBtrfs cPath pStat
-                sel pStat)))
+                throwErrnoFromResult "btrfs_stat" $ btrfsCStat pBtrfs cPath pStat)))
+
+    return stat
+
+btrfsReadDir
+    :: BTRFS        -- BTRFS volume
+    -> FilePath     -- path to file within volume
+    -> IO [String]
+btrfsReadDir (_, btrfs) path = do
+    contents <- mallocForeignPtr :: IO (ForeignPtr (Ptr CString))
+    count <- mallocForeignPtr :: IO (ForeignPtr CSize)
+
+    withForeignPtr btrfs (\pBtrfs ->
+        withForeignPtr count (\pCount ->
+            withForeignPtr contents (\pContents -> do
+                withCString path (\cPath -> do
+                    throwErrnoFromResult "btrfs_readdir"
+                        $ btrfsCReadDir pBtrfs cPath pCount pContents)
+
+                contentsArrayLength <- fromIntegral <$> peek pCount :: IO Int
+                contentsArray <- peek pContents :: IO (Ptr CString)
+
+                cContents <- peekArray contentsArrayLength contentsArray :: IO [CString]
+                mapM peekCString cContents)))
