@@ -1,7 +1,11 @@
 module Main where
 
 import Graphics.UI.WX
-import BTRFS
+import System.Posix.Internals (st_size)
+import Control.Monad ((>=>))
+
+import BTRFS (btrfsOpenFileFS, btrfsStat)
+import Util ((<.>))
 
 {-
 
@@ -12,7 +16,8 @@ wxHaskell demo (eaxPlayer) v 0.1
 
 main :: IO ()
 main = do
-    btrfsOpenFileFS "testfs"
+    btrfs <- btrfsOpenFileFS "testfs"
+    btrfsStat btrfs "/l1" $ (show <.> st_size) >=> putStrLn
     start gui
 
 gui :: IO ()

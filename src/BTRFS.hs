@@ -1,15 +1,23 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 
-module BTRFS (btrfsOpenFS, btrfsOpenFileFS, btrfsOpenPtrFS) where
+module BTRFS (
+    btrfsOpenFS,
+    btrfsOpenFileFS,
+    btrfsOpenPtrFS,
+    btrfsStat
+) where
 
 import Control.Monad ((<=<))
 import System.IO (FilePath)
 import System.IO.MMap (mmapFileForeignPtr, Mode (ReadOnly))
-import Foreign (ForeignPtr, Ptr, FunPtr, withForeignPtr, newForeignPtr, plusPtr, nullPtr)
+import System.Posix.Internals (CStat, sizeof_stat)
 import Foreign.C.Error (throwErrnoIfNull)
-import Foreign.C.Types (CSize (CSize))
+import Foreign.C.String (CString, withCString)
+import Foreign.C.Types (CSize (CSize), CInt (CInt))
+import Foreign (ForeignPtr, Ptr, FunPtr, withForeignPtr, newForeignPtr,
+    mallocForeignPtrBytes, plusPtr, nullPtr)
 
-import Util ((<.>))
+import Util ((<.>), throwErrnoFromResult)
 
 -- struct btrfs
 data Btrfs
@@ -27,6 +35,9 @@ foreign import ccall "btrfs_openfs" btrfsCOpenFS :: Ptr () -> CSize -> IO (Ptr B
 
 -- void (* btrfs_delete)(struct btrfs *)
 foreign import ccall "&btrfs_delete" btrfsCDeletePtr :: FunPtr (Ptr Btrfs -> IO ())
+
+-- int btrfs_stat(const struct btrfs *, const char *, struct stat *);
+foreign import ccall "btrfs_stat" btrfsCStat :: Ptr Btrfs -> CString -> Ptr CStat -> IO CInt
 
 btrfsOpenFS
     :: (Integral i)
@@ -52,3 +63,17 @@ btrfsOpenPtrFS = curry
     $ newForeignPtr btrfsCDeletePtr
     <=< throwErrnoIfNull "btrfs_openfs"
     . uncurry btrfsCOpenFS
+
+btrfsStat
+    :: BTRFS            -- BTRFS volume
+    -> FilePath         -- path to file within volume
+    -> (Ptr CStat -> IO a) -- selector
+    -> IO a
+btrfsStat (_, btrfs) path sel = do
+    stat <- mallocForeignPtrBytes sizeof_stat
+
+    withForeignPtr btrfs (\pBtrfs ->
+        withForeignPtr stat (\pStat ->
+            withCString path (\cPath -> do
+                throwErrnoFromResult "btrfs_stat" $ btrfsCStat pBtrfs cPath pStat
+                sel pStat)))
