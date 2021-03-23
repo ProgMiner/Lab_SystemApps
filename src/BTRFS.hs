@@ -5,18 +5,23 @@ module BTRFS (
     btrfsOpenFileFS,
     btrfsOpenPtrFS,
     btrfsStat,
-    btrfsReadDir
+    btrfsReadDir,
+    btrfsRead,
+    btrfsReadString
 ) where
 
+import Data.Word (Word8)
 import Control.Monad ((<=<))
 import System.IO (FilePath)
 import System.IO.MMap (mmapFileForeignPtr, Mode (ReadOnly))
 import System.Posix.Internals (CStat, sizeof_stat)
+import System.Posix.Types (COff (COff))
 import Foreign.C.Error (throwErrnoIfNull)
-import Foreign.C.String (CString, withCString, peekCString)
-import Foreign.C.Types (CSize (CSize), CInt (CInt))
+import Foreign.C.String (CString, withCString, peekCString, castCCharToChar)
+import Foreign.C.Types (CSize (CSize), CInt (CInt), CChar (CChar))
 import Foreign (ForeignPtr, Ptr, FunPtr, withForeignPtr, newForeignPtr,
-    mallocForeignPtr, mallocForeignPtrBytes, plusPtr, nullPtr, peek, peekArray)
+    mallocForeignPtr, mallocForeignPtrArray, mallocForeignPtrBytes,
+    plusPtr, nullPtr, peek, peekArray)
 
 import Util ((<.>), throwErrnoFromResult)
 
@@ -53,6 +58,21 @@ foreign import ccall "btrfs_readdir" btrfsCReadDir
     -> Ptr (Ptr CString)
     -> IO CInt
 
+-- int btrfs_read(
+--         const struct btrfs * btrfs,
+--         const char * filename,
+--         char * data,
+--         size_t length,
+--         off_t offset
+-- )
+foreign import ccall "btrfs_read" btrfsCRead
+    :: Ptr Btrfs
+    -> CString
+    -> Ptr CChar
+    -> CSize
+    -> COff
+    -> IO CInt
+
 btrfsOpenFS
     :: (Integral i)
     => ForeignPtr ()    -- pointer to a btrfs volume
@@ -87,8 +107,9 @@ btrfsStat (_, btrfs) path = do
 
     withForeignPtr btrfs (\pBtrfs ->
         withForeignPtr stat (\pStat ->
-            withCString path (\cPath -> do
-                throwErrnoFromResult "btrfs_stat" $ btrfsCStat pBtrfs cPath pStat)))
+            withCString path (\cPath ->
+                throwErrnoFromResult "btrfs_stat"
+                    $ btrfsCStat pBtrfs cPath pStat)))
 
     return stat
 
@@ -100,15 +121,50 @@ btrfsReadDir (_, btrfs) path = do
     contents <- mallocForeignPtr :: IO (ForeignPtr (Ptr CString))
     count <- mallocForeignPtr :: IO (ForeignPtr CSize)
 
-    withForeignPtr btrfs (\pBtrfs ->
-        withForeignPtr count (\pCount ->
-            withForeignPtr contents (\pContents -> do
-                withCString path (\cPath -> do
+    withForeignPtr count (\pCount ->
+        withForeignPtr contents (\pContents -> do
+            withForeignPtr btrfs (\pBtrfs ->
+                withCString path (\cPath ->
                     throwErrnoFromResult "btrfs_readdir"
-                        $ btrfsCReadDir pBtrfs cPath pCount pContents)
+                        $ btrfsCReadDir pBtrfs cPath pCount pContents))
 
-                contentsArrayLength <- fromIntegral <$> peek pCount :: IO Int
-                contentsArray <- peek pContents :: IO (Ptr CString)
+            contentsArrayLength <- fromIntegral <$> peek pCount :: IO Int
+            contentsArray <- peek pContents :: IO (Ptr CString)
 
-                cContents <- peekArray contentsArrayLength contentsArray :: IO [CString]
-                mapM peekCString cContents)))
+            cContents <- peekArray contentsArrayLength contentsArray :: IO [CString]
+            mapM peekCString cContents))
+
+btrfsRead'
+    :: BTRFS
+    -> FilePath
+    -> Int
+    -> Int
+    -> IO [CChar]
+btrfsRead' (_, btrfs) path length offset = do
+    buf <- mallocForeignPtrArray length :: IO (ForeignPtr CChar)
+
+    withForeignPtr buf (\pBuf ->
+        withForeignPtr btrfs (\pBtrfs ->
+            withCString path (\cPath ->
+                throwErrnoFromResult "btrfs_read"
+                    $ btrfsCRead pBtrfs cPath pBuf
+                        (fromIntegral length) (fromIntegral offset)))
+        >>= flip peekArray pBuf . fromIntegral)
+
+btrfsRead
+    :: BTRFS
+    -> FilePath
+    -> Int
+    -> Int
+    -> IO [Word8]
+btrfsRead btrfs path length offset = map fromIntegral
+    <$> btrfsRead' btrfs path length offset
+
+btrfsReadString
+    :: BTRFS
+    -> FilePath
+    -> Int
+    -> Int
+    -> IO String
+btrfsReadString btrfs path length offset = map castCCharToChar
+    <$> btrfsRead' btrfs path length offset
