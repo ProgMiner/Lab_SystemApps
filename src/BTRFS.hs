@@ -17,7 +17,7 @@ import System.IO.MMap (mmapFileForeignPtr, Mode (ReadOnly))
 import System.Posix.Internals (CStat, sizeof_stat)
 import System.Posix.Types (COff (COff))
 import Foreign.C.Error (throwErrnoIfNull)
-import Foreign.C.String (CString, withCString, peekCString, castCCharToChar)
+import Foreign.C.String (CString, withCString, peekCString, peekCStringLen)
 import Foreign.C.Types (CSize (CSize), CInt (CInt), CChar (CChar))
 import Foreign (ForeignPtr, Ptr, FunPtr, withForeignPtr, newForeignPtr,
     mallocForeignPtr, mallocForeignPtrArray, mallocForeignPtrBytes,
@@ -135,36 +135,40 @@ btrfsReadDir (_, btrfs) path = do
             mapM peekCString cContents))
 
 btrfsRead'
-    :: BTRFS
-    -> FilePath
-    -> Int
-    -> Int
-    -> IO [CChar]
+    :: BTRFS        -- BTRFS volume
+    -> FilePath     -- path to file within volume
+    -> Int          -- count of bytes to read
+    -> Int          -- number of first byte in file to read
+    -> IO (ForeignPtr CChar, Int)
 btrfsRead' (_, btrfs) path length offset = do
     buf <- mallocForeignPtrArray length :: IO (ForeignPtr CChar)
 
-    withForeignPtr buf (\pBuf ->
-        withForeignPtr btrfs (\pBtrfs ->
-            withCString path (\cPath ->
-                throwErrnoFromResult "btrfs_read"
-                    $ btrfsCRead pBtrfs cPath pBuf
-                        (fromIntegral length) (fromIntegral offset)))
-        >>= flip peekArray pBuf . fromIntegral)
+    bytesRead <- fromIntegral <$>
+        withForeignPtr buf (\pBuf ->
+            withForeignPtr btrfs (\pBtrfs ->
+                withCString path (\cPath ->
+                    throwErrnoFromResult "btrfs_read"
+                        $ btrfsCRead pBtrfs cPath pBuf
+                            (fromIntegral length) (fromIntegral offset))))
+
+    return (buf, bytesRead)
 
 btrfsRead
-    :: BTRFS
-    -> FilePath
-    -> Int
-    -> Int
+    :: BTRFS        -- BTRFS volume
+    -> FilePath     -- path to file within volume
+    -> Int          -- count of bytes to read
+    -> Int          -- number of first byte in file to read
     -> IO [Word8]
-btrfsRead btrfs path length offset = map fromIntegral
-    <$> btrfsRead' btrfs path length offset
+btrfsRead btrfs path length offset = do
+    (buf, bytesRead) <- btrfsRead' btrfs path length offset
+    map fromIntegral <$> withForeignPtr buf (peekArray bytesRead)
 
 btrfsReadString
-    :: BTRFS
-    -> FilePath
-    -> Int
-    -> Int
+    :: BTRFS        -- BTRFS volume
+    -> FilePath     -- path to file within volume
+    -> Int          -- count of bytes to read
+    -> Int          -- number of first byte in file to read
     -> IO String
-btrfsReadString btrfs path length offset = map castCCharToChar
-    <$> btrfsRead' btrfs path length offset
+btrfsReadString btrfs path length offset = do
+    (buf, bytesRead) <- btrfsRead' btrfs path length offset
+    withForeignPtr buf $ peekCStringLen . flip (,) bytesRead
