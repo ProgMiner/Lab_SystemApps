@@ -7,12 +7,16 @@ module BTRFS (
     btrfsStat,
     btrfsReadDir,
     btrfsRead,
-    btrfsReadString
+    btrfsReadString,
+    btrfsGetContents,
+    btrfsGetContentsString,
+    btrfsReadLink
 ) where
 
 import Data.Word (Word8)
 import Control.Monad ((<=<))
 import System.IO (FilePath)
+import System.IO.Unsafe (unsafeInterleaveIO)
 import System.IO.MMap (mmapFileForeignPtr, Mode (ReadOnly))
 import System.Posix.Internals (CStat, sizeof_stat)
 import System.Posix.Types (COff (COff))
@@ -71,6 +75,19 @@ foreign import ccall "btrfs_read" btrfsCRead
     -> Ptr CChar
     -> CSize
     -> COff
+    -> IO CInt
+
+-- int btrfs_readlink(
+--         const struct btrfs * btrfs,
+--         const char * filename,
+--         char * data,
+--         size_t length
+-- )
+foreign import ccall "btrfs_readlink" btrfsCReadLink
+    :: Ptr Btrfs
+    -> CString
+    -> Ptr CChar
+    -> CSize
     -> IO CInt
 
 btrfsOpenFS
@@ -172,3 +189,52 @@ btrfsReadString
 btrfsReadString btrfs path length offset = do
     (buf, bytesRead) <- btrfsRead' btrfs path length offset
     withForeignPtr buf $ peekCStringLen . flip (,) bytesRead
+
+btrfsGetContents
+    :: BTRFS        -- BTRFS volume
+    -> FilePath     -- path to file within volume
+    -> IO [Word8]
+btrfsGetContents btrfs path = btrfsGetContents' 256 0 where
+    btrfsGetContents' :: Int -> Int -> IO [Word8]
+    btrfsGetContents' len off = do
+        (buf, bytesRead) <- btrfsRead' btrfs path len off :: IO (ForeignPtr CChar, Int)
+        bytes <- map fromIntegral <$> withForeignPtr buf (peekArray bytesRead) :: IO [Word8]
+
+        if bytesRead == len
+            then unsafeInterleaveIO $ (bytes ++) <$> btrfsGetContents' len (off + len)
+            else return bytes
+
+-- not lazy!
+btrfsGetContentsString
+    :: BTRFS        -- BTRFS volume
+    -> FilePath     -- path to file within volume
+    -> IO String
+btrfsGetContentsString btrfs path = btrfsGetContentsString' 256 where
+    btrfsGetContentsString' :: Int -> IO String
+    btrfsGetContentsString' len = do
+        (buf, bytesRead) <- btrfsRead' btrfs path len 0 :: IO (ForeignPtr CChar, Int)
+
+        if bytesRead == len
+            then unsafeInterleaveIO $ btrfsGetContentsString' (2 * len)
+            else withForeignPtr buf (peekCStringLen . flip (,) bytesRead) :: IO String
+
+btrfsReadLink
+    :: BTRFS        -- BTRFS volume
+    -> FilePath     -- path to file within volume
+    -> IO String
+btrfsReadLink (_, btrfs) path = btrfsReadLink' 256 where
+    btrfsReadLink' :: Int -> IO String
+    btrfsReadLink' len = do
+        buf <- mallocForeignPtrArray len :: IO (ForeignPtr CChar)
+
+        withForeignPtr buf (\pBuf ->
+            withForeignPtr btrfs (\pBtrfs ->
+                withCString path (\cPath ->
+                    throwErrnoFromResult "btrfs_readlink"
+                        $ btrfsCReadLink pBtrfs cPath pBuf $ fromIntegral len)))
+
+        content <- withForeignPtr buf peekCString :: IO String
+
+        if length content == len
+            then unsafeInterleaveIO $ btrfsReadLink' (2 * len)
+            else return content
