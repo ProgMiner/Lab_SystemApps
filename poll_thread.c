@@ -10,14 +10,21 @@
 /* I think 250 ms is optimal in order to give time to events for arriving
  * and to not block register functions
  */
-#define POLL_WAIT_TIME (250)
+/* #define POLL_WAIT_TIME (250) */
+#define POLL_WAIT_TIME (64)
 
+
+struct poll_thread_fd_item {
+    struct pollfd * fd;
+    struct stream * stream;
+};
 
 struct poll_thread {
     unsigned int amount;
     unsigned int capacity;
+
     struct pollfd * fds;
-    struct stream ** streams;
+    struct poll_thread_fd_item * fd_items;
     pthread_mutex_t mutex;
 };
 
@@ -32,9 +39,9 @@ struct poll_thread * poll_thread_new() {
     poll_thread->amount = 0;
     poll_thread->capacity = 4;
     poll_thread->fds = malloc(sizeof(struct pollfd) * 4);
-    poll_thread->streams = malloc(sizeof(struct stream *) * 4);
+    poll_thread->fd_items = malloc(sizeof(struct poll_thread_fd_item) * 4);
 
-    if (!poll_thread->fds || !poll_thread->streams) {
+    if (!poll_thread->fds || !poll_thread->fd_items) {
         goto free_poll_thread;
     }
 
@@ -47,7 +54,7 @@ struct poll_thread * poll_thread_new() {
 
 free_poll_thread:
     free(poll_thread->fds);
-    free(poll_thread->streams);
+    free(poll_thread->fd_items);
     free(poll_thread);
 
 end:
@@ -66,7 +73,7 @@ void poll_thread_delete(struct poll_thread * poll_thread) {
     pthread_mutex_destroy(&(poll_thread->mutex));
 
     free(poll_thread->fds);
-    free(poll_thread->streams);
+    free(poll_thread->fd_items);
     free(poll_thread);
 }
 
@@ -76,8 +83,8 @@ int poll_thread_register(
         short events,
         struct stream * stream
 ) {
+    struct poll_thread_fd_item * new_fd_items;
     unsigned int i, new_capacity;
-    struct stream ** new_streams;
     struct pollfd * new_fds;
     int ret = 0;
 
@@ -91,7 +98,7 @@ int poll_thread_register(
             continue;
         }
 
-        if (poll_thread->streams[i] != stream) {
+        if (poll_thread->fd_items[i].stream != stream) {
             continue;
         }
 
@@ -114,9 +121,10 @@ int poll_thread_register(
             goto unlock_mutex;
         }
 
-        new_streams = realloc(poll_thread->streams, sizeof(struct stream *) * new_capacity);
-        if (new_streams) {
-            poll_thread->streams = new_streams;
+        new_fd_items = realloc(poll_thread->fd_items,
+                sizeof(struct poll_thread_fd_item *) * new_capacity);
+        if (new_fd_items) {
+            poll_thread->fd_items = new_fd_items;
         } else {
             ret = -ENOMEM;
             goto unlock_mutex;
@@ -127,7 +135,9 @@ int poll_thread_register(
 
     poll_thread->fds[poll_thread->amount].fd = fd;
     poll_thread->fds[poll_thread->amount].events = events;
-    poll_thread->streams[poll_thread->amount] = stream;
+    poll_thread->fds[poll_thread->amount].revents = 0;
+    poll_thread->fd_items[poll_thread->amount].fd = poll_thread->fds + poll_thread->amount;
+    poll_thread->fd_items[poll_thread->amount].stream = stream;
     ++poll_thread->amount;
 
     /* ret = 0 here */
@@ -161,7 +171,7 @@ int poll_thread_unregister(struct poll_thread * poll_thread, int fd, short event
             --poll_thread->amount;
 
             poll_thread->fds[i] = poll_thread->fds[poll_thread->amount];
-            poll_thread->streams[i] = poll_thread->streams[poll_thread->amount];
+            poll_thread->fd_items[i] = poll_thread->fd_items[poll_thread->amount];
         }
 
         /* not breaking in order to remove from all existing fds with specified fd */
@@ -175,8 +185,10 @@ end:
 }
 
 int poll_thread_run(struct poll_thread * poll_thread) {
-    struct poll_thread_event event;
+    struct poll_thread_fd_item fd_item;
+    struct poll_thread_event * event;
     unsigned int i, j;
+    struct pollfd fd;
     int ret = 0;
 
     while (true) {
@@ -190,22 +202,33 @@ int poll_thread_run(struct poll_thread * poll_thread) {
             goto unlock_mutex;
         }
 
-        for (i = 0; i < poll_thread->amount; ++i) {
+        for (i = 0, j = 0; i < poll_thread->amount && j < ret; ++i) {
             if (!poll_thread->fds[i].revents) {
                 continue;
             }
 
-            event.fd = poll_thread->fds[i].fd;
-            event.events = poll_thread->fds[i].revents;
-            stream_push(poll_thread->streams[i], &event);
+            event = malloc(sizeof(struct poll_thread_event));
+            if (!event) {
+                ret = -errno;
+                goto unlock_mutex;
+            }
 
-            poll_thread->fds[i].revents = 0;
+            fd = poll_thread->fds[i];
+            fd_item = poll_thread->fd_items[i];
+
+            /* unregister manually */
+            --poll_thread->amount;
+            poll_thread->fds[i] = poll_thread->fds[poll_thread->amount];
+            poll_thread->fd_items[i] = poll_thread->fd_items[poll_thread->amount];
+
+            event->fd = fd.fd;
+            event->events = fd.revents;
+            ret = stream_push(fd_item.stream, event, true);
+            if (ret) {
+                goto unlock_mutex;
+            }
 
             ++j;
-            if (j == ret) {
-                ret = 0;
-                break;
-            }
         }
 
         ret = pthread_mutex_unlock(&(poll_thread->mutex));
