@@ -64,6 +64,10 @@ end:
 }
 
 void poll_thread_delete(struct poll_thread * poll_thread) {
+    if (!poll_thread) {
+        return;
+    }
+
     pthread_mutex_destroy(&(poll_thread->mutex));
 
     free(poll_thread->fds);

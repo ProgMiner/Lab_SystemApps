@@ -48,6 +48,10 @@ struct promise * promise_new(tpool_t * thread_pool) {
 void promise_delete(struct promise * promise) {
     struct promise_handler_list * handlers, * handlers_next = promise->handlers;
 
+    if (!promise) {
+        return;
+    }
+
     if (promise->value_free) {
         promise->value_free(promise->value);
     }
