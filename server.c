@@ -11,48 +11,74 @@
 #include "poll_thread.h"
 
 
-struct server_socket_stream_handler_context {
+struct server_socket_promise_handler_context {
+    struct promise ** server_socket_promise;
     struct poll_thread * poll_thread;
     tpool_t * thread_pool;
     int server_socket;
-    struct stream * server_socket_stream;
 };
 
-struct socket_stream_handler_context {
+struct socket_promise_handler_context {
     struct poll_thread * poll_thread;
     struct sockaddr_in6 addr;
     tpool_t * thread_pool;
     int socket;
-    struct stream * socket_stream;
+    struct promise * socket_promise;
 };
 
-static void socket_stream_handler(
-        struct stream * result_stream,
-        struct socket_stream_handler_context * context,
+static struct promise_handler_result socket_promise_handler(
+        struct socket_promise_handler_context * context,
         struct poll_thread_event * event
 ) {
     printf("321 %d\n", context->socket);
     fflush(stdout);
+
+    return promise_handler_result(NULL, NULL);
 }
 
-static void server_socket_stream_handler(
-        struct stream * result_stream,
-        struct server_socket_stream_handler_context * context,
+static struct promise_handler_result server_socket_promise_handler(
+        struct server_socket_promise_handler_context * context_ptr,
         struct poll_thread_event * event
 ) {
+    struct server_socket_promise_handler_context context = *context_ptr;
+
     struct sockaddr_in6 addr;
     socklen_t addrlen = sizeof(addr);
-    struct socket_stream_handler_context * socket_stream_handler_context;
-    struct stream * socket_stream, * socket_stream_continue;
+    struct socket_promise_handler_context * socket_promise_handler_context;
+    struct promise * socket_promise;
     int socket, socket_flags;
 
-    socket = accept(context->server_socket, (struct sockaddr *) &addr, &addrlen);
+    socket = accept(context.server_socket, (struct sockaddr *) &addr, &addrlen);
+
+    promise_delete(*context.server_socket_promise);
+    *context.server_socket_promise = poll_thread_register(
+            context.poll_thread,
+            context.server_socket,
+            POLLIN
+    );
+
+    if (!(*context.server_socket_promise)) {
+        goto end;
+    }
+
+    context_ptr = malloc(sizeof(struct server_socket_promise_handler_context));
+    if (!context_ptr) {
+        goto free_poll_thread_register;
+    }
+
+    *context_ptr = context;
+
+    if (promise_handle(*context.server_socket_promise, context_ptr,
+            server_socket_promise_handler, free)) {
+        goto free_context_ptr;
+    }
+
     if (socket < 0) {
-        return;
+        goto free_context_ptr;
     }
 
     if (sizeof(addr) != addrlen) {
-        return;
+        goto free_context_ptr;
     }
 
     socket_flags = fcntl(socket, F_GETFL, 0);
@@ -64,63 +90,58 @@ static void server_socket_stream_handler(
         goto free_socket;
     }
 
-    socket_stream = stream_new(context->thread_pool);
-    if (!socket_stream) {
+    socket_promise = poll_thread_register(context.poll_thread, socket, POLLIN);
+    if (!socket_promise) {
         goto free_socket;
     }
 
-    if (poll_thread_register(
-            context->poll_thread,
-            socket,
-            POLLIN,
-            socket_stream
+    socket_promise_handler_context = malloc(sizeof(struct socket_promise_handler_context));
+    if (!socket_promise_handler_context) {
+        goto free_socket_promise;
+    }
+
+    socket_promise_handler_context->poll_thread = context.poll_thread;
+    socket_promise_handler_context->thread_pool = context.thread_pool;
+    socket_promise_handler_context->socket = socket;
+    socket_promise_handler_context->socket_promise = socket_promise;
+    socket_promise_handler_context->addr = addr;
+
+    if (promise_handle(
+            socket_promise,
+            socket_promise_handler_context,
+            socket_promise_handler,
+            free
     )) {
-        goto free_socket_stream;
-    }
-
-    socket_stream_handler_context = malloc(sizeof(struct socket_stream_handler_context));
-    socket_stream_handler_context->poll_thread = context->poll_thread;
-    socket_stream_handler_context->thread_pool = context->thread_pool;
-    socket_stream_handler_context->socket = socket;
-    socket_stream_handler_context->socket_stream = socket_stream;
-    socket_stream_handler_context->addr = addr;
-    if (!socket_stream_handler_context) {
-        goto free_poll_thread_register;
-    }
-
-    socket_stream_continue = stream_subscribe(socket_stream,
-            socket_stream_handler_context, socket_stream_handler);
-
-    if (!socket_stream_continue) {
-        goto free_socket_stream_handler_context;
+        goto free_socket_promise_handler_context;
     }
 
     printf("123 %d\n", socket);
-    fflush(stdout);
 
-    if (poll_thread_register(context->poll_thread, context->server_socket, POLLIN,
-            context->server_socket_stream)) {
-        goto free_socket_stream_handler_context;
-    }
+    goto end;
 
-    return;
+free_socket_promise_handler_context:
+    free(socket_promise_handler_context);
 
-free_socket_stream_handler_context:
-    free(socket_stream_handler_context);
-
-free_poll_thread_register:
-    poll_thread_unregister(context->poll_thread, socket, POLLIN);
-
-free_socket_stream:
-    stream_delete(socket_stream);
+free_socket_promise:
+    poll_thread_unregister(context.poll_thread, socket_promise);
+    promise_delete(socket_promise);
 
 free_socket:
     close(socket);
+
+free_context_ptr:
+    free(context_ptr);
+
+free_poll_thread_register:
+    poll_thread_unregister(context.poll_thread, *context.server_socket_promise);
+
+end:
+    return promise_handler_result(NULL, NULL);
 }
 
 int server_main(struct server_config config) {
-    struct server_socket_stream_handler_context * server_socket_stream_handler_context;
-    struct stream * server_socket_stream, * server_socket_stream_continue;
+    struct server_socket_promise_handler_context * server_socket_promise_handler_context;
+    struct promise ** server_socket_promise;
     struct poll_thread * poll_thread;
     int server_socket, ret = 0;
     tpool_t * thread_pool;
@@ -145,60 +166,63 @@ int server_main(struct server_config config) {
         goto free_server_socket;
     }
 
-    poll_thread = poll_thread_new();
-    if (!poll_thread) {
-        ret = -errno;
-        goto free_server_socket;
-    }
-
     thread_pool = tpool_create(8);
 
-    server_socket_stream = stream_new(thread_pool);
-    if (!server_socket_stream) {
+    poll_thread = poll_thread_new(thread_pool);
+    if (!poll_thread) {
         ret = -errno;
         goto free_thread_pool;
     }
 
-    server_socket_stream_handler_context = malloc(sizeof(struct server_socket_stream_handler_context));
-    if (!server_socket_stream_handler_context) {
-        ret = -errno;
-        goto free_server_socket_stream;
+    server_socket_promise = malloc(sizeof(struct promise *));
+    if (!server_socket_promise) {
+        ret = -ENOMEM;
+        goto free_poll_thread;
     }
 
-    server_socket_stream_handler_context->poll_thread = poll_thread;
-    server_socket_stream_handler_context->thread_pool = thread_pool;
-    server_socket_stream_handler_context->server_socket = server_socket;
-    server_socket_stream_handler_context->server_socket_stream = server_socket_stream;
-
-    server_socket_stream_continue = stream_subscribe(server_socket_stream,
-            server_socket_stream_handler_context, server_socket_stream_handler);
-
-    if (!server_socket_stream_continue) {
-        ret = -errno;
-        goto free_server_socket_stream_handler_context;
-    }
-
-    ret = poll_thread_register(poll_thread, server_socket, POLLIN, server_socket_stream);
+    *server_socket_promise = poll_thread_register(poll_thread, server_socket, POLLIN);
     if (ret) {
-        goto free_server_socket_stream_continue;
+        goto free_server_socket_promise;
+    }
+
+    server_socket_promise_handler_context = malloc(sizeof(struct server_socket_promise_handler_context));
+    if (!server_socket_promise_handler_context) {
+        ret = -ENOMEM;
+        goto free_poll_thread_register;
+    }
+
+    server_socket_promise_handler_context->server_socket_promise = server_socket_promise;
+    server_socket_promise_handler_context->poll_thread = poll_thread;
+    server_socket_promise_handler_context->thread_pool = thread_pool;
+    server_socket_promise_handler_context->server_socket = server_socket;
+
+    ret = promise_handle(
+            *server_socket_promise,
+            server_socket_promise_handler_context,
+            server_socket_promise_handler,
+            free
+    );
+
+    if (ret) {
+        goto free_server_socket_promise_handler_context;
     }
 
     ret = poll_thread_run(poll_thread);
 
-free_server_socket_stream_continue:
-    stream_delete(server_socket_stream_continue);
+free_server_socket_promise_handler_context:
+    free(server_socket_promise_handler_context);
 
-free_server_socket_stream_handler_context:
-    free(server_socket_stream_handler_context);
+free_poll_thread_register:
+    poll_thread_unregister(poll_thread, *server_socket_promise);
 
-free_server_socket_stream:
-    stream_delete(server_socket_stream);
+free_server_socket_promise:
+    free(server_socket_promise);
+
+free_poll_thread:
+    poll_thread_delete(poll_thread);
 
 free_thread_pool:
     tpool_destroy(thread_pool);
-
-/* free_poll_thread: */
-    poll_thread_delete(poll_thread);
 
 free_server_socket:
     close(server_socket);

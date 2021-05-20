@@ -5,8 +5,8 @@ CFLAGS = -std=gnu89 -pedantic-errors -Wall -Werror -g -O0 # -O2
 LFLAGS = -pthread
 
 BUILDPATH = build
-SOURCES = main.c server.c stream.c poll_thread.c thread_pool.c
-HEADERS = server.h stream.h poll_thread.h thread_pool.h
+SOURCES = main.c server.c promise.c poll_thread.c thread_pool.c
+HEADERS = server.h promise.h poll_thread.h thread_pool.h
 TARGET = lab3
 
 OBJECTS = $(SOURCES:%.c=$(BUILDPATH)/%.o)

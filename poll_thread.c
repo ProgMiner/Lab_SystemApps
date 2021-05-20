@@ -10,13 +10,12 @@
 /* I think 250 ms is optimal in order to give time to events for arriving
  * and to not block register functions
  */
-/* #define POLL_WAIT_TIME (250) */
-#define POLL_WAIT_TIME (64)
+#define POLL_WAIT_TIME (250)
 
 
 struct poll_thread_fd_item {
     struct pollfd * fd;
-    struct stream * stream;
+    struct promise * promise;
 };
 
 struct poll_thread {
@@ -25,10 +24,12 @@ struct poll_thread {
 
     struct pollfd * fds;
     struct poll_thread_fd_item * fd_items;
+
+    tpool_t * thread_pool;
     pthread_mutex_t mutex;
 };
 
-struct poll_thread * poll_thread_new() {
+struct poll_thread * poll_thread_new(tpool_t * thread_pool) {
     struct poll_thread * poll_thread = malloc(sizeof(struct poll_thread));
     int err;
 
@@ -38,6 +39,7 @@ struct poll_thread * poll_thread_new() {
 
     poll_thread->amount = 0;
     poll_thread->capacity = 4;
+    poll_thread->thread_pool = thread_pool;
     poll_thread->fds = malloc(sizeof(struct pollfd) * 4);
     poll_thread->fd_items = malloc(sizeof(struct poll_thread_fd_item) * 4);
 
@@ -62,14 +64,6 @@ end:
 }
 
 void poll_thread_delete(struct poll_thread * poll_thread) {
-    /* ???
-    unsigned int i;
-
-    for (i = 0; i < poll_thread->amount; ++i) {
-        stream_delete(poll_thread->streams[i]);
-    }
-    */
-
     pthread_mutex_destroy(&(poll_thread->mutex));
 
     free(poll_thread->fds);
@@ -77,39 +71,24 @@ void poll_thread_delete(struct poll_thread * poll_thread) {
     free(poll_thread);
 }
 
-int poll_thread_register(
-        struct poll_thread * poll_thread,
-        int fd,
-        short events,
-        struct stream * stream
-) {
+struct promise * poll_thread_register(struct poll_thread * poll_thread, int fd, short events) {
     struct poll_thread_fd_item * new_fd_items;
-    unsigned int i, new_capacity;
+    unsigned int new_capacity;
+    struct promise * promise;
     struct pollfd * new_fds;
     int ret = 0;
 
-    ret = pthread_mutex_lock(&(poll_thread->mutex));
-    if (ret) {
+    promise = promise_new(poll_thread->thread_pool);
+    if (!promise) {
+        ret = -ENOMEM;
         goto end;
     }
 
-    for (i = 0; i < poll_thread->amount; ++i) {
-        if (poll_thread->fds[i].fd != fd) {
-            continue;
-        }
-
-        if (poll_thread->fd_items[i].stream != stream) {
-            continue;
-        }
-
-        /* adding events to existing fd */
-        poll_thread->fds[i].events |= events;
-
-        ret = 0;
-        goto unlock_mutex;
+    ret = pthread_mutex_lock(&(poll_thread->mutex));
+    if (ret) {
+        goto free_promise;
     }
 
-    /* adding new fd */
     if (poll_thread->capacity == poll_thread->amount) {
         new_capacity = poll_thread->capacity * 2;
 
@@ -137,7 +116,7 @@ int poll_thread_register(
     poll_thread->fds[poll_thread->amount].events = events;
     poll_thread->fds[poll_thread->amount].revents = 0;
     poll_thread->fd_items[poll_thread->amount].fd = poll_thread->fds + poll_thread->amount;
-    poll_thread->fd_items[poll_thread->amount].stream = stream;
+    poll_thread->fd_items[poll_thread->amount].promise = promise;
     ++poll_thread->amount;
 
     /* ret = 0 here */
@@ -145,11 +124,21 @@ int poll_thread_register(
 unlock_mutex:
     pthread_mutex_unlock(&(poll_thread->mutex));
 
+free_promise:
+    if (ret) {
+        free(promise);
+        promise = NULL;
+    }
+
 end:
-    return ret;
+    if (ret) {
+        errno = -ret;
+    }
+
+    return promise;
 }
 
-int poll_thread_unregister(struct poll_thread * poll_thread, int fd, short events) {
+int poll_thread_unregister(struct poll_thread * poll_thread, struct promise * promise) {
     unsigned int i;
     int ret = 0;
 
@@ -159,22 +148,13 @@ int poll_thread_unregister(struct poll_thread * poll_thread, int fd, short event
     }
 
     for (i = 0; i < poll_thread->amount; ++i) {
-        if (poll_thread->fds[i].fd != fd) {
+        if (poll_thread->fd_items[i].promise != promise) {
             continue;
         }
 
-        /* removing events from fd */
-        poll_thread->fds[i].events &= ~events;
-
-        /* if events == 0 then remove fd */
-        if (poll_thread->fds[i].events == 0) {
-            --poll_thread->amount;
-
-            poll_thread->fds[i] = poll_thread->fds[poll_thread->amount];
-            poll_thread->fd_items[i] = poll_thread->fd_items[poll_thread->amount];
-        }
-
-        /* not breaking in order to remove from all existing fds with specified fd */
+        --poll_thread->amount;
+        poll_thread->fds[i] = poll_thread->fds[poll_thread->amount];
+        poll_thread->fd_items[i] = poll_thread->fd_items[poll_thread->amount];
     }
 
 /* unlock_mutex: */
@@ -223,8 +203,7 @@ int poll_thread_run(struct poll_thread * poll_thread) {
 
             event->fd = fd.fd;
             event->events = fd.revents;
-            ret = stream_push(fd_item.stream, event, true);
-            if (ret) {
+            if ((ret = promise_resolve(fd_item.promise, event, free))) {
                 goto unlock_mutex;
             }
 
