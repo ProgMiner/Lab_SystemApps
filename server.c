@@ -4,11 +4,13 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <string.h>
 #include <stdlib.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 
 #include "poll_thread.h"
+#include "io_utils.h"
 #include "buffer.h"
 
 
@@ -18,69 +20,35 @@ struct server_socket_promise_handler_context {
     int server_socket;
 };
 
-struct socket_promise_handler_context {
-    struct promise ** socket_promise;
-    struct poll_thread * poll_thread;
-    struct sockaddr_in6 addr;
-    struct buffer * buffer;
-    int socket;
-};
-
 static struct promise_handler_result socket_promise_handler(
-        struct socket_promise_handler_context * context_ptr,
-        struct poll_thread_event * event
+        void * context,
+        struct buffer * buffer
 ) {
-    struct socket_promise_handler_context context = *context_ptr;
-    int ret;
+    size_t content_length = buffer_length(buffer);
+    char * content = malloc(content_length + 1);
 
-    ret = buffer_read_fd(context.buffer, context.socket);
-    if (ret < 0) {
-        goto end;
+    if (!content) {
+        return promise_handler_result(NULL, NULL);
     }
 
-    promise_delete(*context.socket_promise);
-    *context.socket_promise = poll_thread_register(
-            context.poll_thread,
-            context.socket,
-            POLLIN
-    );
+    strncpy(content, (char *) buffer_content(buffer), content_length);
+    content[content_length] = '\0';
 
-    if (!(*context.socket_promise)) {
-        goto end;
-    }
+    printf("Received request:\n%s", content);
+    free(content);
 
-    context_ptr = malloc(sizeof(struct socket_promise_handler_context));
-    if (!context_ptr) {
-        goto free_poll_thread_register;
-    }
-
-    *context_ptr = context;
-
-    if (promise_handle(*context.socket_promise, context_ptr, socket_promise_handler, free)) {
-        goto free_context_ptr;
-    }
-
-    goto end;
-
-free_context_ptr:
-    free(context_ptr);
-
-free_poll_thread_register:
-    poll_thread_unregister(context.poll_thread, *context.socket_promise);
-    promise_delete(*context.socket_promise);
-
-end:
-    return promise_handler_result(NULL, NULL);
+    return promise_handler_result(buffer, NULL);
 }
 
+/* TODO handle connection closing */
 static int handle_client_socket(
         struct server_socket_promise_handler_context context,
         int socket,
         struct sockaddr_in6 addr
 ) {
-    struct socket_promise_handler_context * socket_promise_handler_context;
-    struct promise ** socket_promise;
     int socket_flags, ret = 0;
+    struct promise * promise;
+    struct buffer * buffer;
 
     socket_flags = fcntl(socket, F_GETFL, 0);
     if (socket_flags < 0) {
@@ -92,43 +60,22 @@ static int handle_client_socket(
         goto end;
     }
 
-    socket_promise = malloc(sizeof(struct socket_promise *));
-    if (!socket_promise) {
-        ret = -errno;
+    buffer = buffer_new(BUFFER_DEFAULT_CAPACITY);
+    if (!buffer) {
+        ret = -ENOMEM;
         goto end;
     }
 
-    *socket_promise = poll_thread_register(context.poll_thread, socket, POLLIN);
-    if (!*socket_promise) {
-        ret = -errno;
-        goto free_socket_promise;
-    }
-
-    socket_promise_handler_context = malloc(sizeof(struct socket_promise_handler_context));
-    if (!socket_promise_handler_context) {
-        ret = -ENOMEM;
-        goto free_poll_thread_register;
-    }
-
-    socket_promise_handler_context->poll_thread = context.poll_thread;
-    socket_promise_handler_context->socket_promise = socket_promise;
-    socket_promise_handler_context->socket = socket;
-    socket_promise_handler_context->addr = addr;
-
-    socket_promise_handler_context->buffer = buffer_new(BUFFER_DEFAULT_CAPACITY);
-    if (!socket_promise_handler_context->buffer) {
-        ret = -ENOMEM;
-        goto free_socket_promise_handler_context;
-    }
-
-    if (promise_handle(
-            *socket_promise,
-            socket_promise_handler_context,
+    promise = promise_then(
+            io_utils_read_chunk(context.poll_thread, socket, buffer),
+            NULL,
             socket_promise_handler,
-            free
-    )) {
+            NULL
+    );
+
+    if (!promise) {
         ret = -errno;
-        goto free_socket_promise_handler_context;
+        goto free_buffer;
     }
 
     printf("[%d] Connection from: %02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
@@ -144,16 +91,8 @@ static int handle_client_socket(
 
     goto end;
 
-free_socket_promise_handler_context:
-    buffer_delete(socket_promise_handler_context->buffer);
-    free(socket_promise_handler_context);
-
-free_poll_thread_register:
-    poll_thread_unregister(context.poll_thread, *socket_promise);
-    promise_delete(*socket_promise);
-
-free_socket_promise:
-    free(socket_promise);
+free_buffer:
+    buffer_delete(buffer);
 
 end:
     return ret;
