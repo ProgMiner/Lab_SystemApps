@@ -17,27 +17,18 @@
 struct server_socket_promise_handler_context {
     struct promise ** server_socket_promise;
     struct poll_thread * poll_thread;
+    struct tpool * thread_pool;
     int server_socket;
 };
 
 static struct promise_handler_result socket_promise_handler(
         void * context,
-        struct buffer * buffer
+        char * line
 ) {
-    size_t content_length = buffer_length(buffer);
-    char * content = malloc(content_length + 1);
+    printf("First line of request: \"%s\"\n", line);
+    free(line);
 
-    if (!content) {
-        return promise_handler_result(NULL, NULL);
-    }
-
-    strncpy(content, (char *) buffer_content(buffer), content_length);
-    content[content_length] = '\0';
-
-    printf("Received request:\n%s", content);
-    free(content);
-
-    return promise_handler_result(buffer, NULL);
+    return promise_handler_result(NULL, NULL);
 }
 
 /* TODO handle connection closing */
@@ -67,7 +58,7 @@ static int handle_client_socket(
     }
 
     promise = promise_then(
-            io_utils_read_chunk(context.poll_thread, socket, buffer),
+            io_utils_read_line(context.thread_pool, context.poll_thread, socket, buffer),
             NULL,
             socket_promise_handler,
             NULL
@@ -215,6 +206,7 @@ int server_main(struct server_config config) {
 
     server_socket_promise_handler_context->server_socket_promise = server_socket_promise;
     server_socket_promise_handler_context->poll_thread = poll_thread;
+    server_socket_promise_handler_context->thread_pool = thread_pool;
     server_socket_promise_handler_context->server_socket = server_socket;
 
     ret = promise_handle(
