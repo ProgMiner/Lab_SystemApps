@@ -204,7 +204,7 @@ btrfsGetContents btrfs path = btrfsGetContents' 256 0 where
             then unsafeInterleaveIO $ (bytes ++) <$> btrfsGetContents' len (off + len)
             else return bytes
 
--- not lazy!
+-- TODO: make it lazy
 btrfsGetContentsString
     :: BTRFS        -- BTRFS volume
     -> FilePath     -- path to file within volume
@@ -218,6 +218,7 @@ btrfsGetContentsString btrfs path = btrfsGetContentsString' 256 where
             then unsafeInterleaveIO $ btrfsGetContentsString' (2 * len)
             else withForeignPtr buf (peekCStringLen . flip (,) bytesRead) :: IO String
 
+-- not lazy!
 btrfsReadLink
     :: BTRFS        -- BTRFS volume
     -> FilePath     -- path to file within volume
@@ -236,5 +237,5 @@ btrfsReadLink (_, btrfs) path = btrfsReadLink' 256 where
         content <- withForeignPtr buf peekCString :: IO String
 
         if length content == len
-            then unsafeInterleaveIO $ btrfsReadLink' (2 * len)
+            then btrfsReadLink' (2 * len)
             else return content
