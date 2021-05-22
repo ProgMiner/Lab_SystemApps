@@ -41,7 +41,6 @@ struct poll_thread_run_task_context {
 
     struct poll_thread_handler handler;
     struct poll_thread_event event;
-    int descriptor;
 };
 
 struct poll_thread * poll_thread_new(tpool_t * thread_pool) {
@@ -258,8 +257,7 @@ end:
 static void poll_thread_run_task(struct poll_thread_run_task_context * context) {
     int ret = context->handler.handler(
             context->handler.context,
-            context->event,
-            context->descriptor
+            context->event
     );
 
     if (ret) {
@@ -293,7 +291,7 @@ int poll_thread_run(struct poll_thread * poll_thread) {
         }
 
         for (i = 0, j = 0; i < poll_thread->amount && j < ret; ++i) {
-            if (!poll_thread->fds[i].revents) {
+            if ((poll_thread->fds[i].revents & poll_thread->fds[i].events) == 0) {
                 continue;
             }
 
@@ -304,10 +302,10 @@ int poll_thread_run(struct poll_thread * poll_thread) {
             }
 
             task_context->poll_thread = poll_thread;
+            task_context->event.descriptor = poll_thread->fd_items[i].descriptor;
             task_context->event.fd = poll_thread->fds[i].fd;
-            task_context->event.events = poll_thread->fds[i].revents;
+            task_context->event.events = poll_thread->fds[i].revents & poll_thread->fds[i].events;
             task_context->handler = poll_thread->fd_items[i].handler;
-            task_context->descriptor = poll_thread->fd_items[i].descriptor;
 
             poll_thread->fds[i].fd = -1;
             poll_thread->fds[i].revents = 0;

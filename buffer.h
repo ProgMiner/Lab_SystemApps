@@ -4,18 +4,19 @@
 #include <stdint.h>
 
 
-#define BUFFER_DEFAULT_CAPACITY (4096)
-
-
 struct buffer;
 
 struct buffer * buffer_new(size_t capacity);
 void buffer_delete(struct buffer * buffer);
 
-size_t buffer_length(struct buffer * buffer);
+size_t buffer_position(struct buffer * buffer);
+size_t buffer_limit(struct buffer * buffer);
+size_t buffer_capacity(struct buffer * buffer);
+size_t buffer_remaining(struct buffer * buffer);
 uint8_t * buffer_content(struct buffer * buffer);
+uint8_t * buffer_remaining_content(struct buffer * buffer);
 
-int buffer_append(struct buffer * buffer, uint8_t * bytes, size_t bytes_length);
-int buffer_drop_to(struct buffer * buffer, size_t position);
+void buffer_flip(struct buffer * buffer);
+void buffer_drop_start(struct buffer * buffer);
 
 int buffer_read_fd(struct buffer * buffer, int fd);

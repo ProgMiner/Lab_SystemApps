@@ -16,21 +16,40 @@
 
 struct server_socket_handler_context {
     struct poll_thread * poll_thread;
-    struct tpool * thread_pool;
     int server_socket;
 };
 
-/*
-static int socket_handler(
-        void * context,
-        char * line
-) {
-    printf("First line of request: \"%s\"\n", line);
-    free(line);
+struct socket_handler_context {
+    struct poll_thread * poll_thread;
+    struct buffer * buffer;
+    int socket;
+};
 
+static int socket_handler(
+        struct socket_handler_context * context,
+        struct poll_thread_event event
+) {
+    char * str;
+    int ret;
+
+    ret = buffer_read_fd(context->buffer, event.fd);
+    if (ret < 0) {
+        return ret;
+    }
+
+    str = malloc(sizeof(char) * (ret + 1));
+    if (!str) {
+        return -ENOMEM;
+    }
+
+    memcpy(str, (char *) (buffer_remaining_content(context->buffer) - ret), ret);
+    str[ret] = '\0';
+
+    printf("[%d] Request chunk received (%d):\n%s", event.fd, ret, str);
+
+    free(str);
     return 0;
 }
-*/
 
 /* TODO handle connection closing */
 static int handle_client_socket(
@@ -38,7 +57,8 @@ static int handle_client_socket(
         int socket,
         struct sockaddr_in6 addr
 ) {
-    int socket_flags, ret = 0;
+    struct socket_handler_context * socket_handler_context;
+    int socket_flags, ret = 0, socket_handler_descriptor;
     struct buffer * buffer;
 
     socket_flags = fcntl(socket, F_GETFL, 0);
@@ -51,13 +71,28 @@ static int handle_client_socket(
         goto end;
     }
 
-    buffer = buffer_new(BUFFER_DEFAULT_CAPACITY);
+    buffer = buffer_new(1024);
     if (!buffer) {
         ret = -ENOMEM;
         goto end;
     }
 
-    /* TODO */
+    socket_handler_context = malloc(sizeof(struct socket_handler_context));
+    if (!socket_handler_context) {
+        ret = -ENOMEM;
+        goto free_buffer;
+    }
+
+    socket_handler_context->poll_thread = context.poll_thread;
+    socket_handler_context->buffer = buffer;
+    socket_handler_context->socket = socket;
+
+    socket_handler_descriptor = poll_thread_register(context.poll_thread, socket, POLLIN,
+            poll_thread_handler(socket_handler_context, socket_handler));
+    if (socket_handler_descriptor < 0) {
+        ret = socket_handler_descriptor;
+        goto free_socket_handler_context;
+    }
 
     printf("[%d] Connection from: %02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
             socket,
@@ -72,7 +107,10 @@ static int handle_client_socket(
 
     goto end;
 
-/* free_buffer: */
+free_socket_handler_context:
+    free(socket_handler_context);
+
+free_buffer:
     buffer_delete(buffer);
 
 end:
@@ -81,8 +119,7 @@ end:
 
 static int server_socket_handler(
         struct server_socket_handler_context * context,
-        struct poll_thread_event event,
-        int descriptor
+        struct poll_thread_event event
 ) {
     struct sockaddr_in6 addr;
     socklen_t addrlen = sizeof(addr);
@@ -99,7 +136,7 @@ static int server_socket_handler(
         goto free_context;
     }
 
-    ret = poll_thread_continue(context->poll_thread, descriptor);
+    ret = poll_thread_continue(context->poll_thread, event.descriptor);
     if (ret) {
         goto free_socket;
     }
@@ -123,8 +160,8 @@ end:
 
 int server_main(struct server_config config) {
     struct server_socket_handler_context * server_socket_handler_context;
+    int server_socket, ret = 0, server_socket_handler_descriptor;
     struct poll_thread * poll_thread;
-    int server_socket, ret = 0;
     tpool_t * thread_pool;
 
     struct sockaddr_in6 addr = { AF_INET6 };
@@ -162,12 +199,12 @@ int server_main(struct server_config config) {
     }
 
     server_socket_handler_context->poll_thread = poll_thread;
-    server_socket_handler_context->thread_pool = thread_pool;
     server_socket_handler_context->server_socket = server_socket;
 
-    ret = poll_thread_register(poll_thread, server_socket, POLLIN,
+    server_socket_handler_descriptor = poll_thread_register(poll_thread, server_socket, POLLIN,
             poll_thread_handler(server_socket_handler_context, server_socket_handler));
-    if (ret) {
+    if (server_socket_handler_descriptor < 0) {
+        ret = server_socket_handler_descriptor;
         goto free_server_socket_handler_context;
     }
 

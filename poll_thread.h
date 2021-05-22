@@ -12,11 +12,13 @@
 struct poll_thread;
 
 struct poll_thread_event {
+    int descriptor;
+
     int fd;
     short events;
 };
 
-typedef int poll_thread_handler_function(void *, struct poll_thread_event, int);
+typedef int poll_thread_handler_function(void *, struct poll_thread_event);
 
 struct poll_thread_handler {
     void * context;
