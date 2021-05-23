@@ -16,6 +16,8 @@ size_t buffer_remaining(struct buffer * buffer);
 uint8_t * buffer_content(struct buffer * buffer);
 uint8_t * buffer_remaining_content(struct buffer * buffer);
 
+void buffer_move(struct buffer * buffer, long offset);
+
 void buffer_flip(struct buffer * buffer);
 void buffer_drop_start(struct buffer * buffer);
 

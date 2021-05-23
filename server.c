@@ -10,8 +10,8 @@
 #include <sys/socket.h>
 
 #include "poll_thread.h"
-#include "io_utils.h"
 #include "buffer.h"
+#include "http.h"
 
 
 struct server_socket_handler_context {
@@ -21,6 +21,8 @@ struct server_socket_handler_context {
 
 struct socket_handler_context {
     struct poll_thread * poll_thread;
+    struct http_request_parser * request_parser;
+    struct http_request * request;
     struct buffer * buffer;
     int socket;
 };
@@ -29,7 +31,7 @@ static int socket_handler(
         struct socket_handler_context * context,
         struct poll_thread_event event
 ) {
-    char * str;
+    enum http_request_parser_result parser_result;
     int ret;
 
     ret = buffer_read_fd(context->buffer, event.fd);
@@ -37,18 +39,51 @@ static int socket_handler(
         return ret;
     }
 
-    str = malloc(sizeof(char) * (ret + 1));
-    if (!str) {
-        return -ENOMEM;
+    ret = 0;
+
+    buffer_flip(context->buffer);
+    parser_result = http_request_parser_parse(context->request_parser, context->buffer);
+    switch (parser_result) {
+    case HTTP_REQUEST_PARSER_RESULT_DONE:
+        buffer_drop_start(context->buffer);
+
+        /* TODO */
+        printf("[%d] Request received\n%s", event.fd, http_request_body(context->request, NULL));
+        break;
+
+    case HTTP_REQUEST_PARSER_RESULT_MORE:
+        buffer_drop_start(context->buffer);
+        ret = poll_thread_continue(context->poll_thread, event.descriptor);
+
+        if (ret) {
+            goto free_poll_thread_register;
+        }
+
+        break;
+
+    case HTTP_REQUEST_PARSER_RESULT_INVAL:
+        ret = poll_thread_unregister(context->poll_thread, event.descriptor);
+        goto free_context;
+
+    case HTTP_REQUEST_PARSER_RESULT_ERROR:
+        ret = -errno;
+        goto free_poll_thread_register;
     }
 
-    memcpy(str, (char *) (buffer_remaining_content(context->buffer) - ret), ret);
-    str[ret] = '\0';
+    goto end;
 
-    printf("[%d] Request chunk received (%d):\n%s", event.fd, ret, str);
+free_poll_thread_register:
+    poll_thread_unregister(context->poll_thread, event.descriptor);
 
-    free(str);
-    return 0;
+free_context:
+    http_request_parser_delete(context->request_parser);
+    http_request_delete(context->request);
+    buffer_delete(context->buffer);
+    close(context->socket);
+    free(context);
+
+end:
+    return ret;
 }
 
 /* TODO handle connection closing */
@@ -59,7 +94,6 @@ static int handle_client_socket(
 ) {
     struct socket_handler_context * socket_handler_context;
     int socket_flags, ret = 0, socket_handler_descriptor;
-    struct buffer * buffer;
 
     socket_flags = fcntl(socket, F_GETFL, 0);
     if (socket_flags < 0) {
@@ -71,27 +105,39 @@ static int handle_client_socket(
         goto end;
     }
 
-    buffer = buffer_new(1024);
-    if (!buffer) {
+    socket_handler_context = malloc(sizeof(struct socket_handler_context));
+    if (!socket_handler_context) {
         ret = -ENOMEM;
         goto end;
     }
 
-    socket_handler_context = malloc(sizeof(struct socket_handler_context));
-    if (!socket_handler_context) {
-        ret = -ENOMEM;
+    socket_handler_context->buffer = buffer_new(1024);
+    if (!socket_handler_context->buffer) {
+        ret = -errno;
+        goto free_socket_handler_context;
+    }
+
+    socket_handler_context->request = http_request_new();
+    if (!socket_handler_context->request) {
+        ret = -errno;
         goto free_buffer;
     }
 
+    socket_handler_context->request_parser =
+            http_request_parser_new(socket_handler_context->request);
+    if (!socket_handler_context->request_parser) {
+        ret = -errno;
+        goto free_request;
+    }
+
     socket_handler_context->poll_thread = context.poll_thread;
-    socket_handler_context->buffer = buffer;
     socket_handler_context->socket = socket;
 
     socket_handler_descriptor = poll_thread_register(context.poll_thread, socket, POLLIN,
             poll_thread_handler(socket_handler_context, socket_handler));
     if (socket_handler_descriptor < 0) {
         ret = socket_handler_descriptor;
-        goto free_socket_handler_context;
+        goto free_request_parser;
     }
 
     printf("[%d] Connection from: %02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
@@ -107,11 +153,17 @@ static int handle_client_socket(
 
     goto end;
 
-free_socket_handler_context:
-    free(socket_handler_context);
+free_request_parser:
+    http_request_parser_delete(socket_handler_context->request_parser);
+
+free_request:
+    http_request_delete(socket_handler_context->request);
 
 free_buffer:
-    buffer_delete(buffer);
+    buffer_delete(socket_handler_context->buffer);
+
+free_socket_handler_context:
+    free(socket_handler_context);
 
 end:
     return ret;

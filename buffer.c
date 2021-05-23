@@ -73,7 +73,7 @@ size_t buffer_remaining(struct buffer * buffer) {
         return 0;
     }
 
-    return buffer->capacity - buffer->position;
+    return buffer->limit - buffer->position;
 }
 
 uint8_t * buffer_content(struct buffer * buffer) {
@@ -90,6 +90,24 @@ uint8_t * buffer_remaining_content(struct buffer * buffer) {
     }
 
     return buffer->content + buffer->position;
+}
+
+void buffer_move(struct buffer * buffer, long offset) {
+    if (!buffer) {
+        return;
+    }
+
+    if (offset < 0 && -offset > buffer->position) {
+        buffer->position = 0;
+        return;
+    }
+
+    if (offset > buffer->limit - buffer->position) {
+        buffer->position = buffer->limit;
+        return;
+    }
+
+    buffer->position += offset;
 }
 
 void buffer_flip(struct buffer * buffer) {
