@@ -6,7 +6,6 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/types.h>
 #include <sys/socket.h>
 
 #include "poll_thread.h"
@@ -32,6 +31,13 @@ struct socket_handler_context {
     struct http_request * request;
     struct buffer * buffer;
     int socket;
+};
+
+struct socket_write_handler_context {
+    struct socket_handler_context * socket_context;
+    int socket_handler_descriptor;
+    uint8_t * data;
+    size_t data_size;
 };
 
 static char * make_request_path(const char * work_dir, const char * path) {
@@ -77,13 +83,42 @@ static char * make_request_path(const char * work_dir, const char * path) {
     return real_request_path;
 }
 
+static int socket_write_handler(
+        struct socket_write_handler_context * context,
+        struct poll_thread_event event
+) {
+    int ret = 0;
+
+    printf("[%d] Writing %lu bytes\n", context->socket_context->socket, context->data_size);
+    write(event.fd, context->data, context->data_size);
+
+    ret = poll_thread_unregister(context->socket_context->server_context->poll_thread, event.descriptor);
+    if (ret < 0) {
+        goto end;
+    }
+
+    ret = poll_thread_continue(context->socket_context->server_context->poll_thread, context->socket_handler_descriptor);
+    if (ret < 0) {
+        goto end;
+    }
+
+    goto end;
+
+    /* TODO: think about free */
+
+end:
+    return ret;
+}
+
 /* TODO send error codes */
 static int http_request_handler(
         struct socket_handler_context * context,
         int poll_thread_descriptor
 ) {
     char * request_path;
-    int ret = 0;
+    int ret = 0, socket_write_handler_descriptor;
+    struct socket_write_handler_context * socket_write_handler_context;
+    char * response_data = "HTTP/1.1 200 OK\nContent-Length: 3\nContent-Type: text/plain; charset=utf-8\n\nKEK";
 
     request_path = make_request_path(
             context->server_context->work_dir,
@@ -95,13 +130,30 @@ static int http_request_handler(
         goto end;
     }
 
-    /* TODO */
     printf("[%d] Request received\n", context->socket);
     printf("[%d] Request path: %s\n", context->socket, request_path);
 
+    socket_write_handler_context = malloc(sizeof(struct socket_write_handler_context));
+    if (!socket_write_handler_context) {
+        ret = -ENOMEM;
+        goto free_request_path;
+    }
+
+    socket_write_handler_context->socket_context = context;
+    socket_write_handler_context->socket_handler_descriptor = poll_thread_descriptor;
+    socket_write_handler_context->data = (uint8_t *) response_data;
+    socket_write_handler_context->data_size = strlen(response_data);
+
+    socket_write_handler_descriptor = poll_thread_register(context->server_context->poll_thread, context->socket, POLLOUT,
+            poll_thread_handler(socket_write_handler_context, socket_write_handler));
+    if (socket_write_handler_descriptor < 0) {
+        ret = socket_write_handler_descriptor;
+        goto free_request_path;
+    }
+
     /* several requests sequential! (pipelining) */
 
-/* free_request_path: */
+free_request_path:
     free(request_path);
 
 end:
