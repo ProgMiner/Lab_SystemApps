@@ -355,7 +355,7 @@ enum http_request_parser_result http_request_parser_parse(
         case HTTP_REQUEST_PARSER_STATE_HEADER_NAME:
             tmp = strnextract(content, content_length, ':');
 
-            if (!tmp) {
+            if (!tmp || strnstr(content, "\r\n", content_length) == content) {
                 tmp = strnsextract(content, content_length, "\r\n");
 
                 if (tmp && strlen(tmp) == 0) {

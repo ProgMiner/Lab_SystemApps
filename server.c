@@ -12,20 +12,101 @@
 #include "poll_thread.h"
 #include "buffer.h"
 #include "http.h"
+#include "util.h"
 
+
+struct server_context {
+    char * work_dir;
+
+    struct poll_thread * poll_thread;
+};
 
 struct server_socket_handler_context {
-    struct poll_thread * poll_thread;
+    struct server_context * server_context;
     int server_socket;
 };
 
 struct socket_handler_context {
-    struct poll_thread * poll_thread;
+    struct server_context * server_context;
     struct http_request_parser * request_parser;
     struct http_request * request;
     struct buffer * buffer;
     int socket;
 };
+
+static char * make_request_path(const char * work_dir, const char * path) {
+    size_t work_dir_length, path_length, request_path_length;
+    char * request_path, * real_request_path;
+
+    if (!work_dir || !path) {
+        return NULL;
+    }
+
+    work_dir_length = strlen(work_dir);
+    path_length = strlen(path);
+
+    request_path_length = work_dir_length + path_length;
+    request_path = malloc(sizeof(char) * (request_path_length + 1));
+    if (!request_path) {
+        return NULL;
+    }
+
+    strncpy(request_path, work_dir, request_path_length);
+    strncat(request_path, path, path_length);
+
+    real_request_path = realpath(request_path, NULL);
+    if (!real_request_path) {
+        free(request_path);
+        return NULL;
+    }
+
+    free(request_path);
+
+    if (!strstartswith(real_request_path, work_dir)) {
+        free(real_request_path);
+        errno = EACCES;
+        return NULL;
+    }
+
+    if (real_request_path[work_dir_length] != '\0' && real_request_path[work_dir_length] != '/') {
+        free(real_request_path);
+        errno = EACCES;
+        return NULL;
+    }
+
+    return real_request_path;
+}
+
+/* TODO send error codes */
+static int http_request_handler(
+        struct socket_handler_context * context,
+        int poll_thread_descriptor
+) {
+    char * request_path;
+    int ret = 0;
+
+    request_path = make_request_path(
+            context->server_context->work_dir,
+            http_request_path(context->request)
+    );
+
+    if (!request_path) {
+        ret = -errno;
+        goto end;
+    }
+
+    /* TODO */
+    printf("[%d] Request received\n", context->socket);
+    printf("[%d] Request path: %s\n", context->socket, request_path);
+
+    /* several requests sequential! (pipelining) */
+
+/* free_request_path: */
+    free(request_path);
+
+end:
+    return ret;
+}
 
 static int socket_handler(
         struct socket_handler_context * context,
@@ -37,6 +118,9 @@ static int socket_handler(
     ret = buffer_read_fd(context->buffer, event.fd);
     if (ret < 0) {
         return ret;
+    } else if (ret == 0) {
+        ret = poll_thread_unregister(context->server_context->poll_thread, event.descriptor);
+        goto free_context;
     }
 
     ret = 0;
@@ -47,14 +131,17 @@ static int socket_handler(
     case HTTP_REQUEST_PARSER_RESULT_DONE:
         buffer_drop_start(context->buffer);
 
-        /* TODO */
-        printf("[%d] Request received\n%s", event.fd, http_request_body(context->request, NULL));
+        ret = http_request_handler(context, event.descriptor);
+        if (ret) {
+            goto free_poll_thread_register;
+        }
+
         break;
 
     case HTTP_REQUEST_PARSER_RESULT_MORE:
         buffer_drop_start(context->buffer);
-        ret = poll_thread_continue(context->poll_thread, event.descriptor);
 
+        ret = poll_thread_continue(context->server_context->poll_thread, event.descriptor);
         if (ret) {
             goto free_poll_thread_register;
         }
@@ -62,7 +149,7 @@ static int socket_handler(
         break;
 
     case HTTP_REQUEST_PARSER_RESULT_INVAL:
-        ret = poll_thread_unregister(context->poll_thread, event.descriptor);
+        ret = poll_thread_unregister(context->server_context->poll_thread, event.descriptor);
         goto free_context;
 
     case HTTP_REQUEST_PARSER_RESULT_ERROR:
@@ -73,7 +160,7 @@ static int socket_handler(
     goto end;
 
 free_poll_thread_register:
-    poll_thread_unregister(context->poll_thread, event.descriptor);
+    poll_thread_unregister(context->server_context->poll_thread, event.descriptor);
 
 free_context:
     http_request_parser_delete(context->request_parser);
@@ -83,6 +170,13 @@ free_context:
     free(context);
 
 end:
+    if (ret) {
+        errno = -ret;
+        fprintf(stderr, "[%d] [WARN] ", context->socket);
+        perror("Error while processing request");
+        ret = 0;
+    }
+
     return ret;
 }
 
@@ -130,17 +224,17 @@ static int handle_client_socket(
         goto free_request;
     }
 
-    socket_handler_context->poll_thread = context.poll_thread;
+    socket_handler_context->server_context = context.server_context;
     socket_handler_context->socket = socket;
 
-    socket_handler_descriptor = poll_thread_register(context.poll_thread, socket, POLLIN,
+    socket_handler_descriptor = poll_thread_register(context.server_context->poll_thread, socket, POLLIN,
             poll_thread_handler(socket_handler_context, socket_handler));
     if (socket_handler_descriptor < 0) {
         ret = socket_handler_descriptor;
         goto free_request_parser;
     }
 
-    printf("[%d] Connection from: %02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+    printf("[%d] [INFO] Connection from: %02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
             socket,
             addr.sin6_addr.s6_addr[0], addr.sin6_addr.s6_addr[1],
             addr.sin6_addr.s6_addr[2], addr.sin6_addr.s6_addr[3],
@@ -188,7 +282,7 @@ static int server_socket_handler(
         goto free_context;
     }
 
-    ret = poll_thread_continue(context->poll_thread, event.descriptor);
+    ret = poll_thread_continue(context->server_context->poll_thread, event.descriptor);
     if (ret) {
         goto free_socket;
     }
@@ -213,6 +307,7 @@ end:
 int server_main(struct server_config config) {
     struct server_socket_handler_context * server_socket_handler_context;
     int server_socket, ret = 0, server_socket_handler_descriptor;
+    struct server_context * server_context;
     struct poll_thread * poll_thread;
     tpool_t * thread_pool;
 
@@ -244,13 +339,27 @@ int server_main(struct server_config config) {
         goto free_thread_pool;
     }
 
-    server_socket_handler_context = malloc(sizeof(struct server_socket_handler_context));
-    if (!server_socket_handler_context) {
+    server_context = malloc(sizeof(struct server_context));
+    if (!server_context) {
         ret = -ENOMEM;
         goto free_poll_thread;
     }
 
-    server_socket_handler_context->poll_thread = poll_thread;
+    server_context->work_dir = realpath(config.work_dir, NULL);
+    if (!server_context->work_dir) {
+        ret = -errno;
+        goto free_server_context;
+    }
+
+    server_context->poll_thread = poll_thread;
+
+    server_socket_handler_context = malloc(sizeof(struct server_socket_handler_context));
+    if (!server_socket_handler_context) {
+        ret = -ENOMEM;
+        goto free_server_context_workdir;
+    }
+
+    server_socket_handler_context->server_context = server_context;
     server_socket_handler_context->server_socket = server_socket;
 
     server_socket_handler_descriptor = poll_thread_register(poll_thread, server_socket, POLLIN,
@@ -264,6 +373,12 @@ int server_main(struct server_config config) {
 
 free_server_socket_handler_context:
     free(server_socket_handler_context);
+
+free_server_context_workdir:
+    free(server_context->work_dir);
+
+free_server_context:
+    free(server_context);
 
 free_poll_thread:
     poll_thread_delete(poll_thread);

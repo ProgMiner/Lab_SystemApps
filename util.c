@@ -88,3 +88,17 @@ char * strtrim(char * value) {
 
     return realloc(value, sizeof(char) * (length + 1));
 }
+
+bool strstartswith(const char * haystack, const char * needle) {
+    size_t haystack_length, needle_length;
+
+    if (!haystack || !needle) {
+        return false;
+    }
+
+    haystack_length = strlen(haystack);
+    needle_length = strlen(needle);
+
+    return strncmp(haystack, needle, haystack_length < needle_length
+            ? haystack_length : needle_length) == 0;
+}
