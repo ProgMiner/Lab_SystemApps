@@ -36,9 +36,11 @@ struct socket_handler_context {
 struct socket_write_handler_context {
     struct socket_handler_context * socket_context;
     int socket_handler_descriptor;
-    uint8_t * data;
-    size_t data_size;
+    struct buffer * buffer;
+    struct buffer * shadow_buffer;
 };
+
+static char * RESPONSE_DATA = "HTTP/1.1 200 OK\nContent-Length: 3\nContent-Type: text/plain; charset=utf-8\n\nKEKE";
 
 static char * make_request_path(const char * work_dir, const char * path) {
     size_t work_dir_length, path_length, request_path_length;
@@ -89,22 +91,39 @@ static int socket_write_handler(
 ) {
     int ret = 0;
 
-    printf("[%d] Writing %lu bytes\n", context->socket_context->socket, context->data_size);
-    write(event.fd, context->data, context->data_size);
-
-    ret = poll_thread_unregister(context->socket_context->server_context->poll_thread, event.descriptor);
-    if (ret < 0) {
-        goto end;
+    if (buffer_remaining(context->shadow_buffer) == 0) {
+        goto poll_thread_continue;
     }
 
+    ret = buffer_write_fd(context->shadow_buffer, event.fd);
+    if (ret <= 0) {
+        goto free_request;
+    }
+
+    printf("[%d] Wrote %d bytes. Remaining: %lu bytes\n", context->socket_context->socket, ret, buffer_remaining(context->shadow_buffer));
+
+poll_thread_continue:
     ret = poll_thread_continue(context->socket_context->server_context->poll_thread, context->socket_handler_descriptor);
     if (ret < 0) {
-        goto end;
+        goto free_request;
     }
 
     goto end;
 
     /* TODO: think about free */
+
+free_request:
+    poll_thread_unregister(context->socket_context->server_context->poll_thread, event.descriptor);
+    http_request_parser_delete(context->socket_context->request_parser);
+    http_request_delete(context->socket_context->request);
+    buffer_delete(context->socket_context->buffer);
+    close(context->socket_context->socket);
+    free(context->socket_context);
+    buffer_delete(context->buffer);
+    free(context->buffer);
+    buffer_delete(context->shadow_buffer);
+    free(context->shadow_buffer);
+    free(context);
 
 end:
     return ret;
@@ -118,7 +137,6 @@ static int http_request_handler(
     char * request_path;
     int ret = 0, socket_write_handler_descriptor;
     struct socket_write_handler_context * socket_write_handler_context;
-    char * response_data = "HTTP/1.1 200 OK\nContent-Length: 3\nContent-Type: text/plain; charset=utf-8\n\nKEK";
 
     request_path = make_request_path(
             context->server_context->work_dir,
@@ -141,17 +159,35 @@ static int http_request_handler(
 
     socket_write_handler_context->socket_context = context;
     socket_write_handler_context->socket_handler_descriptor = poll_thread_descriptor;
-    socket_write_handler_context->data = (uint8_t *) response_data;
-    socket_write_handler_context->data_size = strlen(response_data);
+
+    socket_write_handler_context->buffer = buffer_new(4096);
+    if (!socket_write_handler_context->buffer) {
+        ret = -errno;
+        goto free_socket_write_handler_context;
+    }
+
+    socket_write_handler_context->shadow_buffer = buffer_shadow(socket_write_handler_context->buffer);
+    if (!socket_write_handler_context->shadow_buffer) {
+        ret = -errno;
+        goto free_socket_write_handler_context;
+    }
+
+    buffer_write(socket_write_handler_context->buffer, (uint8_t *) RESPONSE_DATA, strlen(RESPONSE_DATA));
+    buffer_write_shadow(socket_write_handler_context->buffer, socket_write_handler_context->shadow_buffer);
 
     socket_write_handler_descriptor = poll_thread_register(context->server_context->poll_thread, context->socket, POLLOUT,
             poll_thread_handler(socket_write_handler_context, socket_write_handler));
     if (socket_write_handler_descriptor < 0) {
         ret = socket_write_handler_descriptor;
-        goto free_request_path;
+        goto free_socket_write_handler_context;
     }
 
-    /* several requests sequential! (pipelining) */
+    /* TODO: think about several requests sequential! (pipelining) */
+
+    goto end;
+
+free_socket_write_handler_context:
+    free(socket_write_handler_context);
 
 free_request_path:
     free(request_path);
