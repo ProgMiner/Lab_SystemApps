@@ -1,9 +1,11 @@
 #include "server.h"
 
+#include <time.h>
 #include <errno.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -660,6 +662,48 @@ end:
     return ret;
 }
 
+static int server_stop_handler(struct poll_thread * poll_thread, struct poll_thread_event event) {
+    static time_t prev_time = 0;
+    int c;
+
+    while ((c = getc(stdin)) != EOF) {
+        switch (c) {
+        case 'q':
+            poll_thread_stop(poll_thread);
+            return 0;
+
+        case 'p':
+            if (prev_time == 0) {
+                prev_time = time(NULL);
+                printf("Ping! %ld\n", prev_time);
+            } else {
+                printf("Pong! %ld sec\n", time(NULL) - prev_time);
+                prev_time = 0;
+            }
+
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static void setup_sigaction_handler(int sig, siginfo_t * info, void * context) {
+    static const char * msg = "Please, use 'q' instead of Ctrl+C.\n";
+
+    write(STDOUT_FILENO, msg, strlen(msg));
+}
+
+static void setup_sigaction() {
+    struct sigaction sa;
+
+    sa.sa_sigaction = setup_sigaction_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+
+    sigaction(SIGINT, &sa, NULL);
+}
+
 int server_main(struct server_config config) {
     struct server_socket_handler_context * server_socket_handler_context;
     int server_socket, ret = 0, server_socket_handler_descriptor;
@@ -731,7 +775,20 @@ int server_main(struct server_config config) {
         goto free_server_socket_handler_context;
     }
 
+    ret = poll_thread_register(poll_thread, STDIN_FILENO, POLLIN,
+            poll_thread_handler(poll_thread, server_stop_handler));
+    if (ret < 0) {
+        goto free_server_socket_handler_descriptor;
+    }
+
+    setup_sigaction();
+
     ret = poll_thread_run(poll_thread);
+
+    printf("Bye!\n");
+
+free_server_socket_handler_descriptor:
+    poll_thread_unregister(poll_thread, server_socket_handler_descriptor);
 
 free_server_socket_handler_context:
     free(server_socket_handler_context);

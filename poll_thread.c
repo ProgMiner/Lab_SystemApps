@@ -221,8 +221,14 @@ int poll_thread_unregister(struct poll_thread * poll_thread, int descriptor) {
         ? poll_thread->last_descriptor
         : descriptor;
 
+    ret = pthread_mutex_unlock(&(poll_thread->mutex));
+    if (ret) {
+        ret = -ret;
+        goto end;
+    }
+
 unlock_mutex:
-    ret = -pthread_mutex_unlock(&(poll_thread->mutex));
+    pthread_mutex_unlock(&(poll_thread->mutex));
 
 end:
     return ret;
@@ -247,8 +253,14 @@ int poll_thread_continue(struct poll_thread * poll_thread, int descriptor) {
     index = poll_thread->index_by_descriptor[descriptor];
     poll_thread->fds[index].fd = poll_thread->fd_items[index].fd;
 
+    ret = pthread_mutex_unlock(&(poll_thread->mutex));
+    if (ret) {
+        ret = -ret;
+        goto end;
+    }
+
 unlock_mutex:
-    ret = -pthread_mutex_unlock(&(poll_thread->mutex));
+    pthread_mutex_unlock(&(poll_thread->mutex));
 
 end:
     return ret;
@@ -287,6 +299,12 @@ int poll_thread_run(struct poll_thread * poll_thread) {
     while (!poll_thread->stopped) {
         ret = poll(poll_thread->fds, poll_thread->amount, POLL_WAIT_TIME);
         if (ret < 0) {
+            if (errno == EINTR) {
+                ret = 0;
+                continue;
+            }
+
+            ret = -errno;
             goto unlock_mutex;
         }
 
@@ -341,6 +359,28 @@ int poll_thread_run(struct poll_thread * poll_thread) {
 
 unlock_mutex:
     pthread_mutex_unlock(&(poll_thread->mutex));
+
+end:
+    return ret;
+}
+
+int poll_thread_stop(struct poll_thread * poll_thread) {
+    int ret = 0;
+
+    ret = pthread_mutex_lock(&(poll_thread->mutex));
+    if (ret) {
+        ret = -ret;
+        goto end;
+    }
+
+    poll_thread->stopped = true;
+    poll_thread->run_retval = 0;
+
+    ret = pthread_mutex_unlock(&(poll_thread->mutex));
+    if (ret) {
+        ret = -ret;
+        goto end;
+    }
 
 end:
     return ret;
