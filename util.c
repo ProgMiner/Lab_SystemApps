@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <libgen.h>
 
 
 const char * strnstr(const char * haystack, const char * needle, size_t length) {
@@ -71,6 +72,10 @@ char * strtrim(char * value) {
     size_t length;
     char * start;
 
+    if (!value) {
+        return NULL;
+    }
+
     for (start = value; start; ++start) {
         if (!isspace(*start)) {
             break;
@@ -99,6 +104,81 @@ bool strstartswith(const char * haystack, const char * needle) {
     haystack_length = strlen(haystack);
     needle_length = strlen(needle);
 
-    return strncmp(haystack, needle, haystack_length < needle_length
-            ? haystack_length : needle_length) == 0;
+    if (needle_length > haystack_length) {
+        return false;
+    }
+
+    return strncmp(haystack, needle, needle_length) == 0;
+}
+
+bool strendswith(const char * haystack, const char * needle) {
+    size_t haystack_length, needle_length;
+
+    if (!haystack || !needle) {
+        return false;
+    }
+
+    haystack_length = strlen(haystack);
+    needle_length = strlen(needle);
+
+    if (needle_length > haystack_length) {
+        return false;
+    }
+
+    return strncmp(haystack + (haystack_length - needle_length), needle, needle_length) == 0;
+}
+
+char * get_directory(const char * path) {
+    char * buf, * dir;
+
+    buf = strdup(path);
+    if (!buf) {
+        return NULL;
+    }
+
+    dir = strdup(dirname(buf));
+    if (!dir) {
+        return NULL;
+    }
+
+    free(buf);
+    return dir;
+}
+
+char * get_basename(const char * path) {
+    char * buf, * dir;
+
+    buf = strdup(path);
+    if (!buf) {
+        return NULL;
+    }
+
+    dir = strdup(basename(buf));
+    if (!dir) {
+        return NULL;
+    }
+
+    free(buf);
+    return dir;
+}
+
+bool is_extension(const char * basename, const char * ext) {
+    size_t basename_length, ext_length;
+
+    if (!basename || !ext) {
+        return false;
+    }
+
+    basename_length = strlen(basename);
+    ext_length = strlen(ext);
+
+    if (ext_length > basename_length) {
+        return false;
+    }
+
+    if (strncasecmp(basename + (basename_length - ext_length), ext, ext_length) != 0) {
+        return false;
+    }
+
+    return ext[0] == '.' || basename[basename_length - ext_length - 1] == '.';
 }

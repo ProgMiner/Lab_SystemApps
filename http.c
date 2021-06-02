@@ -402,10 +402,10 @@ enum http_request_parser_result http_request_parser_parse(
 
                 move = tmp_length;
             } else {
-                tmp_length = strlen(tmp);
+                tmp_length = strlen(tmp) + 1;
                 header_content_not_ended = false;
 
-                move = tmp_length + 2;
+                move = tmp_length + 1;
             }
 
             new_last_header_value_length = parser->last_header_value_length + tmp_length;

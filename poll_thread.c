@@ -8,10 +8,10 @@
 #include <sched.h>
 
 
-/* I think 25 ms is optimal in order to give time to events for arriving
+/* I think 2 ms is optimal in order to give time to events for arriving
  * and to not block register functions
  */
-#define POLL_WAIT_TIME (25)
+#define POLL_WAIT_TIME (2)
 
 
 struct poll_thread_fd_item {
@@ -75,7 +75,7 @@ struct poll_thread * poll_thread_new(tpool_t * thread_pool) {
 
     err = pthread_mutex_init(&(poll_thread->mutex), NULL);
     if (err) {
-        errno = -err;
+        errno = err;
         goto free_index_by_descriptor;
     }
 
@@ -211,7 +211,7 @@ int poll_thread_unregister(struct poll_thread * poll_thread, int descriptor) {
 
     index = poll_thread->index_by_descriptor[descriptor];
 
-    i = poll_thread->amount--;
+    i = --poll_thread->amount;
     poll_thread->fds[index] = poll_thread->fds[i];
     poll_thread->fd_items[index] = poll_thread->fd_items[i];
     poll_thread->index_by_descriptor[poll_thread->fd_items[index].descriptor] = i;

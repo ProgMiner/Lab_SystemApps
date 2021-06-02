@@ -10,6 +10,7 @@
 
 #include "poll_thread.h"
 #include "buffer.h"
+#include "config.h"
 #include "http.h"
 #include "util.h"
 
@@ -18,6 +19,7 @@ struct server_context {
     char * work_dir;
 
     struct poll_thread * poll_thread;
+    struct config_manager * config_manager;
 };
 
 struct server_socket_handler_context {
@@ -40,7 +42,21 @@ struct socket_write_handler_context {
     struct buffer * shadow_buffer;
 };
 
-static char * RESPONSE_DATA = "HTTP/1.1 200 OK\nContent-Length: 3\nContent-Type: text/plain; charset=utf-8\n\nKEKE";
+struct request_context {
+    struct server_context * server_context;
+    struct http_request * request;
+    char * request_path;
+    int socket;
+
+    struct socket_handler_context * socket_handler_context;
+};
+
+static const char * RESPONSE_DATA =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 3\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "\r\n"
+        "KEKE";
 
 static char * make_request_path(const char * work_dir, const char * path) {
     size_t work_dir_length, path_length, request_path_length;
@@ -100,10 +116,13 @@ static int socket_write_handler(
         goto free_request;
     }
 
-    printf("[%d] Wrote %d bytes. Remaining: %lu bytes\n", context->socket_context->socket, ret, buffer_remaining(context->shadow_buffer));
+    printf("[%d] Wrote %d bytes. Remaining: %lu bytes\n", context->socket_context->socket, ret,
+            buffer_remaining(context->shadow_buffer));
 
 poll_thread_continue:
-    ret = poll_thread_continue(context->socket_context->server_context->poll_thread, context->socket_handler_descriptor);
+    ret = poll_thread_continue(context->socket_context->server_context->poll_thread,
+            context->socket_handler_descriptor);
+
     if (ret < 0) {
         goto free_request;
     }
@@ -127,6 +146,13 @@ free_request:
 
 end:
     return ret;
+
+static int http_request_handler_config_handler(
+        struct request_context * context,
+        struct config config
+) {
+    printf("[%d] Config got!\n", context->socket);
+    return 0;
 }
 
 /* TODO send error codes */
@@ -137,19 +163,33 @@ static int http_request_handler(
     char * request_path;
     int ret = 0, socket_write_handler_descriptor;
     struct socket_write_handler_context * socket_write_handler_context;
+    struct request_context * request_context;
 
-    request_path = make_request_path(
+    printf("[%d] Request received\n", context->socket);
+
+    request_context = malloc(sizeof(struct request_context));
+    if (!request_context) {
+        ret = -ENOMEM;
+        goto end;
+    }
+
+    request_context->request_path = make_request_path(
             context->server_context->work_dir,
             http_request_path(context->request)
     );
 
-    if (!request_path) {
+    if (!request_context->request_path) {
         ret = -errno;
-        goto end;
+        goto free_request_context;
     }
 
-    printf("[%d] Request received\n", context->socket);
-    printf("[%d] Request path: %s\n", context->socket, request_path);
+    printf("[%d] Request path: %s\n", context->socket, request_context->request_path);
+
+    request_context->server_context = context->server_context;
+    request_context->request = context->request;
+    request_context->socket = context->socket;
+
+    request_context->socket_handler_context = context;
 
     socket_write_handler_context = malloc(sizeof(struct socket_write_handler_context));
     if (!socket_write_handler_context) {
@@ -189,8 +229,20 @@ static int http_request_handler(
 free_socket_write_handler_context:
     free(socket_write_handler_context);
 
+    ret = config_manager_resolve(
+            context->server_context->config_manager,
+            request_context->request_path,
+            config_manager_handler(http_request_handler_config_handler, request_context)
+    );
+    if (ret) {
+        goto free_request_path;
+    }
+
 free_request_path:
-    free(request_path);
+    free(request_context->request_path);
+
+free_request_context:
+    free(request_context);
 
 end:
     return ret;
@@ -439,12 +491,18 @@ int server_main(struct server_config config) {
         goto free_server_context;
     }
 
+    server_context->config_manager = config_manager_new(poll_thread, server_context->work_dir);
+    if (!server_context->config_manager) {
+        ret = -errno;
+        goto free_server_context_workdir;
+    }
+
     server_context->poll_thread = poll_thread;
 
     server_socket_handler_context = malloc(sizeof(struct server_socket_handler_context));
     if (!server_socket_handler_context) {
         ret = -ENOMEM;
-        goto free_server_context_workdir;
+        goto free_server_context_config_manager;
     }
 
     server_socket_handler_context->server_context = server_context;
@@ -461,6 +519,9 @@ int server_main(struct server_config config) {
 
 free_server_socket_handler_context:
     free(server_socket_handler_context);
+
+free_server_context_config_manager:
+    config_manager_delete(server_context->config_manager);
 
 free_server_context_workdir:
     free(server_context->work_dir);

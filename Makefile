@@ -5,8 +5,8 @@ CFLAGS = -std=gnu89 -pedantic-errors -Wall -Werror -g -O0 # -O2
 LFLAGS = -pthread
 
 BUILDPATH = build
-SOURCES = main.c server.c poll_thread.c thread_pool.c buffer.c http.c util.c
-HEADERS = server.h poll_thread.h thread_pool.h buffer.h http.h util.h
+SOURCES = main.c server.c poll_thread.c thread_pool.c buffer.c http.c util.c config.c
+HEADERS = server.h poll_thread.h thread_pool.h buffer.h http.h util.h config.h
 TARGET = lab3
 
 OBJECTS = $(SOURCES:%.c=$(BUILDPATH)/%.o)
