@@ -36,7 +36,7 @@ struct socket_handler_context {
 };
 
 struct socket_write_handler_context {
-    struct socket_handler_context * socket_context;
+    struct socket_handler_context * socket_handler_context;
     int socket_handler_descriptor;
     struct buffer * buffer;
     struct buffer * shadow_buffer;
@@ -49,7 +49,36 @@ struct request_context {
     int socket;
 
     struct socket_handler_context * socket_handler_context;
+    int socket_handler_descriptor;
 };
+
+static const char * not_found_response =
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Length: 111\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "\r\n"
+        "<html>\n"
+        "<head>\n"
+        "    <title>404 - Not Found</title>\n"
+        "</head>\n"
+        "<body>\n"
+        "    <h1>File not found :(</h1>\n"
+        "</body>\n"
+        "</html>\n";
+
+static const char * forbidden_response =
+        "HTTP/1.1 403 Forbidden\r\n"
+        "Content-Length: 114\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "\r\n"
+        "<html>\n"
+        "<head>\n"
+        "    <title>403 - Forbidden</title>\n"
+        "</head>\n"
+        "<body>\n"
+        "    <h1>Access forbidden >:(</h1>\n"
+        "</body>\n"
+        "</html>\n";
 
 static const char * RESPONSE_DATA =
         "HTTP/1.1 200 OK\r\n"
@@ -116,11 +145,11 @@ static int socket_write_handler(
         goto free_request;
     }
 
-    printf("[%d] Wrote %d bytes. Remaining: %lu bytes\n", context->socket_context->socket, ret,
+    printf("[%d] Wrote %d bytes. Remaining: %lu bytes\n", context->socket_handler_context->socket, ret,
             buffer_remaining(context->shadow_buffer));
 
 poll_thread_continue:
-    ret = poll_thread_continue(context->socket_context->server_context->poll_thread,
+    ret = poll_thread_continue(context->socket_handler_context->server_context->poll_thread,
             context->socket_handler_descriptor);
 
     if (ret < 0) {
@@ -132,12 +161,12 @@ poll_thread_continue:
     /* TODO: think about free */
 
 free_request:
-    poll_thread_unregister(context->socket_context->server_context->poll_thread, event.descriptor);
-    http_request_parser_delete(context->socket_context->request_parser);
-    http_request_delete(context->socket_context->request);
-    buffer_delete(context->socket_context->buffer);
-    close(context->socket_context->socket);
-    free(context->socket_context);
+    poll_thread_unregister(context->socket_handler_context->server_context->poll_thread, event.descriptor);
+    http_request_parser_delete(context->socket_handler_context->request_parser);
+    http_request_delete(context->socket_handler_context->request);
+    buffer_delete(context->socket_handler_context->buffer);
+    close(context->socket_handler_context->socket);
+    free(context->socket_handler_context);
     buffer_delete(context->buffer);
     free(context->buffer);
     buffer_delete(context->shadow_buffer);
@@ -146,13 +175,86 @@ free_request:
 
 end:
     return ret;
+}
+
+static int http_request_send_response(
+        struct socket_handler_context * socket_handler_context,
+        int socket_handler_descriptor,
+        uint8_t * bytes,
+        size_t bytes_length
+) {
+    struct socket_write_handler_context * socket_write_handler_context;
+    int ret = 0, socket_write_handler_descriptor;
+
+    socket_write_handler_context = malloc(sizeof(struct socket_write_handler_context));
+    if (!socket_write_handler_context) {
+        ret = -ENOMEM;
+        goto free_socket_write_handler_context;
+    }
+
+    socket_write_handler_context->socket_handler_context = socket_handler_context;
+    socket_write_handler_context->socket_handler_descriptor = socket_handler_descriptor;
+
+    socket_write_handler_context->buffer = buffer_new(bytes_length);
+    if (!socket_write_handler_context->buffer) {
+        ret = -errno;
+        goto free_socket_write_handler_context;
+    }
+
+    socket_write_handler_context->shadow_buffer =
+            buffer_shadow(socket_write_handler_context->buffer);
+    if (!socket_write_handler_context->shadow_buffer) {
+        ret = -errno;
+        goto free_socket_write_handler_context;
+    }
+
+    buffer_write(socket_write_handler_context->buffer, bytes, bytes_length);
+    buffer_write_shadow(socket_write_handler_context->buffer,
+            socket_write_handler_context->shadow_buffer);
+
+    socket_write_handler_descriptor = poll_thread_register(
+            socket_handler_context->server_context->poll_thread,
+            socket_handler_context->socket,
+            POLLOUT,
+            poll_thread_handler(socket_write_handler_context, socket_write_handler)
+    );
+
+    if (socket_write_handler_descriptor < 0) {
+        ret = socket_write_handler_descriptor;
+        goto free_socket_write_handler_context;
+    }
+
+    goto end;
+
+free_socket_write_handler_context:
+    free(socket_write_handler_context);
+
+end:
+    return ret;
+}
 
 static int http_request_handler_config_handler(
         struct request_context * context,
         struct config config
 ) {
+    int ret = 0;
+
     printf("[%d] Config got!\n", context->socket);
-    return 0;
+
+    ret = http_request_send_response(context->socket_handler_context,
+            context->socket_handler_descriptor, (uint8_t *) RESPONSE_DATA, strlen(RESPONSE_DATA));
+    if (ret) {
+        goto free_context;
+    }
+
+    goto end;
+
+free_context:
+    free(context->request_path);
+    free(context);
+
+end:
+    return ret;
 }
 
 /* TODO send error codes */
@@ -160,10 +262,8 @@ static int http_request_handler(
         struct socket_handler_context * context,
         int poll_thread_descriptor
 ) {
-    char * request_path;
-    int ret = 0, socket_write_handler_descriptor;
-    struct socket_write_handler_context * socket_write_handler_context;
     struct request_context * request_context;
+    int ret = 0;
 
     printf("[%d] Request received\n", context->socket);
 
@@ -179,7 +279,24 @@ static int http_request_handler(
     );
 
     if (!request_context->request_path) {
-        ret = -errno;
+        switch (errno) {
+        case ENOENT:
+            ret = http_request_send_response(context, poll_thread_descriptor,
+                    (uint8_t *) not_found_response, strlen(not_found_response));
+
+            break;
+
+        case EACCES:
+            ret = http_request_send_response(context, poll_thread_descriptor,
+                    (uint8_t *) forbidden_response, strlen(forbidden_response));
+
+            break;
+
+        default:
+            ret = -errno;
+            break;
+        }
+
         goto free_request_context;
     }
 
@@ -190,44 +307,7 @@ static int http_request_handler(
     request_context->socket = context->socket;
 
     request_context->socket_handler_context = context;
-
-    socket_write_handler_context = malloc(sizeof(struct socket_write_handler_context));
-    if (!socket_write_handler_context) {
-        ret = -ENOMEM;
-        goto free_request_path;
-    }
-
-    socket_write_handler_context->socket_context = context;
-    socket_write_handler_context->socket_handler_descriptor = poll_thread_descriptor;
-
-    socket_write_handler_context->buffer = buffer_new(4096);
-    if (!socket_write_handler_context->buffer) {
-        ret = -errno;
-        goto free_socket_write_handler_context;
-    }
-
-    socket_write_handler_context->shadow_buffer = buffer_shadow(socket_write_handler_context->buffer);
-    if (!socket_write_handler_context->shadow_buffer) {
-        ret = -errno;
-        goto free_socket_write_handler_context;
-    }
-
-    buffer_write(socket_write_handler_context->buffer, (uint8_t *) RESPONSE_DATA, strlen(RESPONSE_DATA));
-    buffer_write_shadow(socket_write_handler_context->buffer, socket_write_handler_context->shadow_buffer);
-
-    socket_write_handler_descriptor = poll_thread_register(context->server_context->poll_thread, context->socket, POLLOUT,
-            poll_thread_handler(socket_write_handler_context, socket_write_handler));
-    if (socket_write_handler_descriptor < 0) {
-        ret = socket_write_handler_descriptor;
-        goto free_socket_write_handler_context;
-    }
-
-    /* TODO: think about several requests sequential! (pipelining) */
-
-    goto end;
-
-free_socket_write_handler_context:
-    free(socket_write_handler_context);
+    request_context->socket_handler_descriptor = poll_thread_descriptor;
 
     ret = config_manager_resolve(
             context->server_context->config_manager,
@@ -237,6 +317,8 @@ free_socket_write_handler_context:
     if (ret) {
         goto free_request_path;
     }
+
+    goto end;
 
 free_request_path:
     free(request_context->request_path);
