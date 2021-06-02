@@ -479,3 +479,9 @@ enum http_request_parser_result http_request_parser_parse(
 
     return HTTP_REQUEST_PARSER_RESULT_DONE;
 }
+
+void http_request_parser_reset(struct http_request_parser * parser) {
+    if (parser) {
+        parser->state = HTTP_REQUEST_PARSER_STATE_METHOD;
+    }
+}

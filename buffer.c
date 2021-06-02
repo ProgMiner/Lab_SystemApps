@@ -196,6 +196,10 @@ ssize_t buffer_read_fd(struct buffer * buffer, int fd) {
         buffer->position += ret;
     }
 
+    if (ret < 0) {
+        ret = -errno;
+    }
+
     return ret;
 }
 
@@ -214,6 +218,10 @@ ssize_t buffer_write_fd(struct buffer * buffer, int fd) {
 
     if ((ret = write(fd, buffer->content + buffer->position, remaining)) > 0) {
         buffer->position += ret;
+    }
+
+    if (ret < 0) {
+        ret = -errno;
     }
 
     return ret;

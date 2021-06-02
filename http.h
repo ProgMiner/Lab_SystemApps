@@ -35,3 +35,4 @@ enum http_request_parser_result http_request_parser_parse(
         struct http_request_parser * parser,
         struct buffer * buffer
 );
+void http_request_parser_reset(struct http_request_parser * parser);

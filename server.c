@@ -7,6 +7,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 
 #include "poll_thread.h"
 #include "buffer.h"
@@ -80,12 +82,11 @@ static const char * forbidden_response =
         "</body>\n"
         "</html>\n";
 
-static const char * RESPONSE_DATA =
+static const char * http_mime_header =
         "HTTP/1.1 200 OK\r\n"
-        "Content-Length: 3\r\n"
-        "Content-Type: text/plain; charset=utf-8\r\n"
-        "\r\n"
-        "KEKE";
+        "Content-Length: %d\r\n"
+        "Content-Type: %s; charset=utf-8\r\n"
+        "\r\n";
 
 static char * make_request_path(const char * work_dir, const char * path) {
     size_t work_dir_length, path_length, request_path_length;
@@ -145,8 +146,8 @@ static int socket_write_handler(
         goto free_request;
     }
 
-    printf("[%d] Wrote %d bytes. Remaining: %lu bytes\n", context->socket_handler_context->socket, ret,
-            buffer_remaining(context->shadow_buffer));
+    printf("[%d] Wrote %d bytes. Remaining: %lu bytes\n", context->socket_handler_context->socket,
+            ret, buffer_remaining(context->shadow_buffer));
 
 poll_thread_continue:
     ret = poll_thread_continue(context->socket_handler_context->server_context->poll_thread,
@@ -233,36 +234,136 @@ end:
     return ret;
 }
 
+static int http_request_send_file_mime(struct request_context * context, const char * mime_type) {
+    uint8_t * response, * content;
+    struct stat file_stat;
+    int ret = 0, file_fd;
+    size_t header_length;
+
+    file_fd = open(context->request_path, 0, O_RDONLY);
+    if (file_fd < 0) {
+        ret = -errno;
+        goto end;
+    }
+
+    ret = fstat(file_fd, &file_stat);
+    if (ret) {
+        ret = -errno;
+        goto free_file_fd;
+    }
+
+    if (!S_ISREG(file_stat.st_mode)) {
+        ret = http_request_send_response(context->socket_handler_context,
+                context->socket_handler_descriptor, (uint8_t *) forbidden_response,
+                strlen(forbidden_response));
+
+        goto free_file_fd;
+    }
+
+    content = mmap(NULL, file_stat.st_size, PROT_READ, MAP_PRIVATE, file_fd, 0);
+    if (content == MAP_FAILED) {
+        ret = -errno;
+        goto free_file_fd;
+    }
+
+    response = malloc(sizeof(uint8_t) * (strlen(http_mime_header) + strlen(mime_type)
+            + file_stat.st_size + 256));
+
+    if (!response) {
+        ret = -ENOMEM;
+        goto free_content;
+    }
+
+    sprintf((char *) response, http_mime_header, file_stat.st_size, mime_type);
+    header_length = strlen((char *) response);
+
+    memcpy(response + header_length, content, file_stat.st_size);
+    ret = munmap(content, file_stat.st_size);
+    if (ret) {
+        ret = -errno;
+        close(file_fd);
+        goto free_response;
+    }
+
+    ret = close(file_fd);
+    if (ret) {
+        ret = -errno;
+        goto free_response;
+    }
+
+    ret = http_request_send_response(context->socket_handler_context,
+            context->socket_handler_descriptor, response, header_length + file_stat.st_size);
+    if (ret) {
+        goto free_response;
+    }
+
+    free(response);
+    goto end;
+
+free_response:
+    free(response);
+    goto end;
+
+free_content:
+    munmap(content, file_stat.st_size);
+
+free_file_fd:
+    close(file_fd);
+
+end:
+    return ret;
+}
+
 static int http_request_handler_config_handler(
         struct request_context * context,
         struct config config
 ) {
     int ret = 0;
 
-    printf("[%d] Config got!\n", context->socket);
+    printf("[%d] Config has got!\n", context->socket);
 
-    ret = http_request_send_response(context->socket_handler_context,
-            context->socket_handler_descriptor, (uint8_t *) RESPONSE_DATA, strlen(RESPONSE_DATA));
-    if (ret) {
-        goto free_context;
+    switch (config.action) {
+    case CONFIG_ACTION_MIME:
+    case CONFIG_ACTION_CGI:
+        /* TODO cgi */
+
+        ret = http_request_send_file_mime(context, config.value.mime_type);
+        if (ret) {
+            goto free_context;
+        }
+
+        break;
+
+    case CONFIG_ACTION_DENY:
+        ret = http_request_send_response(context->socket_handler_context,
+                context->socket_handler_descriptor, (uint8_t *) forbidden_response,
+                strlen(forbidden_response));
+
+        if (ret) {
+            goto free_context;
+        }
+
+        break;
     }
 
     goto end;
 
 free_context:
     free(context->request_path);
+    close(context->socket);
     free(context);
 
 end:
     return ret;
 }
 
-/* TODO send error codes */
 static int http_request_handler(
         struct socket_handler_context * context,
         int poll_thread_descriptor
 ) {
     struct request_context * request_context;
+    struct stat file_stat;
+    char * new_path;
     int ret = 0;
 
     printf("[%d] Request received\n", context->socket);
@@ -278,29 +379,61 @@ static int http_request_handler(
             http_request_path(context->request)
     );
 
-    if (!request_context->request_path) {
-        switch (errno) {
-        case ENOENT:
-            ret = http_request_send_response(context, poll_thread_descriptor,
-                    (uint8_t *) not_found_response, strlen(not_found_response));
+    do {
+        if (!request_context->request_path) {
+            switch (errno) {
+            case ENOENT:
+                ret = http_request_send_response(context, poll_thread_descriptor,
+                        (uint8_t *) not_found_response, strlen(not_found_response));
 
-            break;
+                break;
 
-        case EACCES:
-            ret = http_request_send_response(context, poll_thread_descriptor,
-                    (uint8_t *) forbidden_response, strlen(forbidden_response));
+            case EACCES:
+                ret = http_request_send_response(context, poll_thread_descriptor,
+                        (uint8_t *) forbidden_response, strlen(forbidden_response));
 
-            break;
+                break;
 
-        default:
-            ret = -errno;
-            break;
+            default:
+                ret = -errno;
+                break;
+            }
+
+            goto free_request_context;
         }
 
-        goto free_request_context;
-    }
+        printf("[%d] Request path: %s\n", context->socket, request_context->request_path);
 
-    printf("[%d] Request path: %s\n", context->socket, request_context->request_path);
+        ret = stat(request_context->request_path, &file_stat);
+        if (ret) {
+            ret = -errno;
+            goto free_request_path;
+        }
+
+        if (S_ISDIR(file_stat.st_mode)) {
+            new_path = realloc(request_context->request_path, sizeof(char)
+                    * (strlen(request_context->request_path) + 12));
+
+            if (!new_path) {
+                ret = -ENOMEM;
+                goto free_request_path;
+            }
+
+            strcpy(new_path + strlen(new_path), "/index.html");
+            request_context->request_path = new_path;
+
+            ret = stat(request_context->request_path, &file_stat);
+            if (ret) {
+                free(request_context->request_path);
+                request_context->request_path = NULL;
+                ret = 0;
+            }
+
+            continue;
+        }
+
+        break;
+    } while (true);
 
     request_context->server_context = context->server_context;
     request_context->request = context->request;
@@ -339,7 +472,7 @@ static int socket_handler(
 
     ret = buffer_read_fd(context->buffer, event.fd);
     if (ret < 0) {
-        return ret;
+        goto free_poll_thread_register;
     } else if (ret == 0) {
         ret = poll_thread_unregister(context->server_context->poll_thread, event.descriptor);
         goto free_context;
@@ -353,6 +486,7 @@ static int socket_handler(
     case HTTP_REQUEST_PARSER_RESULT_DONE:
         buffer_drop_start(context->buffer);
 
+        http_request_parser_reset(context->request_parser);
         ret = http_request_handler(context, event.descriptor);
         if (ret) {
             goto free_poll_thread_register;

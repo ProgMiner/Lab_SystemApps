@@ -153,6 +153,10 @@ static struct config_manager_cache * config_manager_cache_remove(
         }
     }
 
+    if (!cur) {
+        return NULL;
+    }
+
     if (prev) {
         prev->next = cur->next;
     } else {
@@ -334,7 +338,6 @@ static int config_manager_traverse_handle_parsed_rules(
     cache = config_manager_cache_find(context->config_manager->cache, context->dir);
     if (cache) {
         config_rule_delete(cache->rules);
-        cache->rules = context->rules;
     } else {
         cache = malloc(sizeof(struct config_manager_cache));
         if (!cache) {
@@ -344,12 +347,12 @@ static int config_manager_traverse_handle_parsed_rules(
 
         cache->next = context->config_manager->cache;
         cache->dir_path = strdup(context->dir);
-        cache->update = time(NULL);
-        cache->rules = context->rules;
 
         context->config_manager->cache = cache;
     }
 
+    cache->update = time(NULL);
+    cache->rules = context->rules;
     context->rules = NULL;
 
     ret = pthread_rwlock_unlock(&(context->config_manager->cache_lock));
@@ -596,20 +599,6 @@ static int config_manager_traverse(
     }
 
     /* config file is not exists */
-
-    ret = close(conf_fd);
-    if (ret) {
-        ret = -errno;
-
-        pthread_rwlock_unlock(&(config_manager->cache_lock));
-        goto end;
-    }
-
-    ret = pthread_rwlock_unlock(&(config_manager->cache_lock));
-    if (ret) {
-        ret = -ret;
-        goto end;
-    }
 
     ret = pthread_rwlock_wrlock(&(config_manager->cache_lock));
     if (ret) {
