@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 
 #include "poll_thread.h"
 #include "buffer.h"
@@ -92,14 +93,24 @@ static const char * http_mime_header =
 
 static char * make_request_path(const char * work_dir, const char * path) {
     size_t work_dir_length, path_length, request_path_length;
-    char * request_path, * real_request_path;
+    char * path_file, * request_path, * real_request_path;
 
     if (!work_dir || !path) {
         return NULL;
     }
 
+    path_file = strnextract(path, strlen(path), '?');
+    if (!path_file) {
+        path_file = strdup(path);
+
+        if (!path_file) {
+            return NULL;
+        }
+    }
+
     work_dir_length = strlen(work_dir);
-    path_length = strlen(path);
+    path_length = strlen(path_file);
+    free(path_file);
 
     request_path_length = work_dir_length + path_length;
     request_path = malloc(sizeof(char) * (request_path_length + 1));
@@ -236,6 +247,231 @@ end:
     return ret;
 }
 
+static int cgi_exec(
+        struct request_context * request_context,
+        const char * script_path,
+        const char * cgi_path
+) {
+    size_t body_length, body_written = 0, content_length;
+    int child_in[2], child_out[2];
+    const uint8_t * body;
+    char * buf, * resp;
+    const char * cbuf;
+    char * envp[18];
+    char * argv[3];
+    unsigned int i;
+    int ret = 0;
+    pid_t cpid;
+
+    argv[0] = strdup(cgi_path);
+    argv[1] = strdup(script_path);
+    argv[2] = NULL;
+
+    if (!argv[0]) {
+        return -errno;
+    }
+
+    if (pipe(child_in)) {
+        free(argv[0]);
+        return -errno;
+    }
+
+    if (pipe(child_out)) {
+        free(argv[0]);
+        close(child_in[0]);
+        close(child_in[1]);
+        return -errno;
+    }
+
+    cpid = fork();
+    if (cpid < 0) {
+        free(argv[0]);
+        close(child_in[0]);
+        close(child_in[1]);
+        close(child_out[0]);
+        close(child_out[1]);
+        return -errno;
+    }
+
+    if (cpid == 0) {
+        if (dup2(child_in[0], 0) < 0 || dup2(child_out[1], 1) < 0) {
+            exit(-errno);
+        }
+
+        close(child_in[0]);
+        close(child_in[1]);
+        close(child_out[0]);
+        close(child_out[1]);
+
+        close(3); /* server socket */
+        close(request_context->socket);
+
+        /* TODO close opened files */
+        /* That's funny security vulnerability =) */
+
+        for (i = 0; i < 17; ++i) {
+            envp[i] = malloc(sizeof(char) * 256);
+
+            if (!envp[i]) {
+                exit(-errno);
+            }
+        }
+
+#define CGI_POPULATE_ENVP(_header, _var) \
+        cbuf = http_headers_get(http_request_headers(request_context->request), _header); \
+        if (cbuf) { \
+            snprintf(envp[i++], 256, "%s=%s", _var, cbuf); \
+        }
+
+        i = 0;
+        CGI_POPULATE_ENVP("Content-Length", "CONTENT_LENGTH");
+        CGI_POPULATE_ENVP("Content-Type", "CONTENT_TYPE");
+        strcpy(envp[i++], "GATEWAY_INTERFACE=CGI/1.1");
+        strcpy(envp[i++], "SERVER_PROTOCOL=HTTP/1.1");
+        strcpy(envp[i++], "REDIRECT_STATUS=404");
+        snprintf(envp[i++], 256, "REQUEST_METHOD=%s", http_request_method(request_context->request));
+        snprintf(envp[i++], 256, "SCRIPT_FILENAME=%s", script_path);
+        snprintf(envp[i++], 256, "SCRIPT_NAME=%s", script_path);
+
+        buf = strchr(http_request_path(request_context->request), '?');
+        if (buf) {
+            snprintf(envp[i++], 256, "QUERY_STRING=%s", buf + 1);
+        }
+
+        snprintf(envp[i], 256, "PATH_INFO=%s", http_request_path(request_context->request));
+        if (buf) {
+            envp[i][buf - http_request_path(request_context->request) + 10] = '\0';
+        }
+
+        ++i;
+
+        for (; i < 17; ++i) {
+            free(envp[i]);
+            envp[i] = NULL;
+        }
+
+        /*
+        "PATH_TRANSLATED"
+        "REMOTE_ADDR"
+        "REMOTE_HOST"
+        "REMOTE_IDENT"
+        "REMOTE_USER"
+        "SERVER_NAME"
+        "SERVER_PORT"
+        "SERVER_SOFTWARE"
+        */
+
+        exit(-execve(cgi_path, argv, envp));
+    }
+
+    close(child_in[0]);
+    close(child_out[1]);
+
+    /* stdin of cgi is child_in[1] */
+    /* stdout of cgi is child_out[0] */
+
+    body = http_request_body(request_context->request, &body_length);
+    while ((body_written = write(child_in[1], body, body_length)) > 0) {
+        body_length += body_written;
+        body += body_written;
+    }
+
+    if (body_written < 0) {
+        ret = -errno;
+        goto end;
+    }
+
+    cpid = waitpid(cpid, NULL, 0);
+    if (cpid < 0) {
+        ret = -errno;
+        goto end;
+    }
+
+    buf = malloc(sizeof(char) * 1024);
+    if (!buf) {
+        ret = -ENOMEM;
+        goto end;
+    }
+
+    resp = NULL;
+    body_length = 0;
+
+    while ((body_written = read(child_out[0], buf, 1024)) > 0) {
+        resp = realloc(resp, sizeof(char) * (body_length + body_written));
+
+        if (!resp) {
+            ret = -errno;
+            goto end;
+        }
+
+        memcpy(resp + body_length, buf, body_written);
+        body_length += body_written;
+    }
+
+    printf("[%d] [INFO] Got %lu bytes from CGI!\n", request_context->socket, body_length);
+
+    free(buf);
+    if (body_written < 0) {
+        free(resp);
+        ret = -errno;
+        goto end;
+    }
+
+    buf = strstr(resp, "Status:");
+    if (buf) {
+        buf = strtrim(strnsextract(buf + 7, body_length - (buf - resp) - 7, "\r\n"));
+
+        if (buf) {
+            printf("[%d] [INFO] CGI Status retrieved: %s\n", request_context->socket, buf);
+        }
+    } else {
+        buf = strdup("200 OK");
+
+        if (!buf) {
+            free(resp);
+            goto end;
+        }
+    }
+
+    body_written = strlen(buf) + 11;
+    resp = realloc(resp, sizeof(char) * (body_length + body_written));
+    memmove(resp + body_written, resp, body_length);
+    snprintf(resp, body_written, "HTTP/1.1 %s\r", buf);
+    resp[body_written - 1] = '\n';
+    body_length += body_written;
+    free(buf);
+
+    buf = strstr(resp + body_written, "\r\n\r\n");
+    if (buf) {
+        content_length = body_length - (buf - resp) - 4;
+    } else {
+        resp = realloc(resp, sizeof(char) * (body_length + 2));
+        memmove(resp + body_written + 2, resp + body_written, body_length - body_written);
+        resp[body_written] = '\r';
+        resp[body_written + 1] = '\n';
+        content_length = body_length - body_written;
+        body_length += 2;
+    }
+
+    buf = malloc(sizeof(char) * 256);
+    snprintf(buf, 256, "Content-Length: %lu\r\n", content_length);
+    content_length = strlen(buf);
+
+    resp = realloc(resp, sizeof(char) * (body_length + content_length));
+    memmove(resp + body_written + content_length, resp + body_written, body_length - body_written);
+    memcpy(resp + body_written, buf, content_length);
+    body_length += content_length;
+    free(buf);
+
+    ret = http_request_send_response(request_context->socket_handler_context,
+            request_context->socket_handler_descriptor, (uint8_t *) resp, body_length);
+
+end:
+    close(child_in[1]);
+    close(child_out[0]);
+    return ret;
+}
+
 static int http_request_send_file_mime(struct request_context * context, const char * mime_type) {
     uint8_t * response, * content;
     struct stat file_stat;
@@ -326,10 +562,17 @@ static int http_request_handler_config_handler(
 
     switch (config.action) {
     case CONFIG_ACTION_MIME:
-    case CONFIG_ACTION_CGI:
-        /* TODO cgi */
-
         ret = http_request_send_file_mime(context, config.value.mime_type);
+
+        if (ret) {
+            goto free_context;
+        }
+
+        break;
+
+    case CONFIG_ACTION_CGI:
+        ret = cgi_exec(context, context->request_path, config.value.interpreter);
+
         if (ret) {
             goto free_context;
         }
